@@ -1,0 +1,35 @@
+# Python: caché y archivos compilados
+__pycache__/
+*.py[cod]
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Variables de entorno y configuración local
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# SoundFlow: caché de audio descargado
+.stream_cache/
+
+# Archivos de registro
+*.log
+
+# Caché de herramientas y pruebas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# macOS: metadatos y archivos auxiliares
+.DS_Store
+.AppleDouble/
+.LSOverride
+._*
+__MACOSX/
