@@ -33,3 +33,5 @@ htmlcov/
 .LSOverride
 ._*
 __MACOSX/
+
+.demo_music/
