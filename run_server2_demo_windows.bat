@@ -1,2 +1,10 @@
 @echo off
-py server.py --host 127.0.0.1 --port 5001 --server-id S2 --advertise-host 127.0.0.1 --max-streams 2 --peer 127.0.0.1:5000 %*
+cd /d "%~dp0"
+if exist ".venv\Scripts\python.exe" (
+  set "PYTHON_BIN=.venv\Scripts\python.exe"
+) else (
+  set "PYTHON_BIN=python"
+)
+"%PYTHON_BIN%" tools\prepare_demo.py
+"%PYTHON_BIN%" server.py --port 5001 --server-id S2 --music .demo_music/S2 --peer http://127.0.0.1:5000 %*
+pause

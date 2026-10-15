@@ -1,912 +1,495 @@
+"""Servicio REST y coordinación de catálogos/transferencias entre nodos HTTP.
+
+No hay límite por número de clientes. La admisión usa CPU/memoria actuales.
+La cola FIFO contiene solicitudes pendientes, no canciones de la interfaz.
+"""
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from pathlib import Path
+import hmac
+import logging
 import math
-import queue
-import socket
+import os
+from pathlib import Path
+import subprocess
+import tempfile
 import threading
 import time
 import uuid
 from typing import Any
 
+from flask import Flask, Response, jsonify, request
+from werkzeug.exceptions import HTTPException
+import psutil
+import requests
+
+from .audio import SAMPLE_RATE, CHANNELS, BYTES_PER_SECOND, CHUNK_BYTES, ffmpeg_executable
+from .http_utils import normalize_url
 from .library import MusicLibrary
-from .protocol import CHUNK_SIZE, decode_json, encode_json, pack_audio_chunk
 
-
-ClientAddress = tuple[str, int]
+log = logging.getLogger('soundflow.server')
 
 
 @dataclass
 class StreamSession:
-    """Estado independiente de una transferencia cliente-servidor."""
-
-    session_id: str
-    request_id: str
-    client: ClientAddress
-    path: Path
-    ack_queue: queue.Queue[int]
-    cancel_event: threading.Event
-    created_at: float
-
-
-@dataclass
-class QueuedRequest:
-    """Petición en espera cuando el clúster no tiene capacidad inmediata."""
-
-    request_id: str
+    id: str
     song_id: str
-    client: ClientAddress
-    visited_server_ids: tuple[str, ...]
-    created_at: float
+    start: float
+    created: float = field(default_factory=time.monotonic)
+    state: str = 'reserved'
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    process: subprocess.Popen | None = None
+    finished: float = 0.0
 
 
 @dataclass
-class CapacityProbe:
-    """Respuestas de capacidad recibidas desde los servidores pares."""
-
-    expected: set[ClientAddress]
-    responses: dict[ClientAddress, dict[str, Any]] = field(default_factory=dict)
-    event: threading.Event = field(default_factory=threading.Event)
+class PendingRequest:
+    id: str
+    song_id: str
+    start: float
+    created: float = field(default_factory=time.monotonic)
+    state: str = 'waiting'
+    stream: dict | None = None
+    reason: str = 'Buscando un servidor disponible con la canción.'
+    error_code: int = 0
 
 
 class SoundFlowServer:
-
-    CLUSTER_CAPACITY_REQUEST = "cluster_capacity_request"
-    CLUSTER_CAPACITY_RESPONSE = "cluster_capacity_response"
-
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        music_dir: Path,
-        max_streams: int = 8,
-        *,
-        server_id: str | None = None,
-        advertise_host: str | None = None,
-        peers: list[ClientAddress] | None = None,
-        probe_timeout: float = 0.60,
-    ) -> None:
-        if max_streams < 1:
-            raise ValueError("max_streams debe ser al menos 1")
-
-        self.host = host
-        self.port = port
-        self.music_dir = Path(music_dir)
-        self.max_streams = max_streams
-        self.probe_timeout = max(0.10, float(probe_timeout))
-
-        if advertise_host:
-            self.advertise_host = advertise_host
-        elif host not in {"0.0.0.0", "::"}:
-            self.advertise_host = host
-        else:
-            # Para pruebas locales. En otra computadora se debe pasar --advertise-host con la IP LAN alcanzable por los clientes.
-            self.advertise_host = "127.0.0.1"
-
-        self.server_id = server_id or f"{self.advertise_host}:{port}"
-        self.peer_addresses = self._normalize_peers(peers or [])
-
-        self.library = MusicLibrary(self.music_dir)
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind((host, port))
-        self.socket.settimeout(0.25)
-
-        self.shutdown_event = threading.Event()
-
-        # Sincronización heredada de P3.
-        self.state_lock = threading.RLock()
-        self.queue_condition = threading.Condition(self.state_lock)
-        self.send_lock = threading.Lock()
-        self.stream_slots = threading.BoundedSemaphore(max_streams)
-
-        # Estado por sesión / cliente.
+    def __init__(self, music_dir: Path, base_url: str, *, server_id: str = 'S1',
+                 peers: list[str] | None = None, verify: bool | str = True,
+                 cpu_threshold: float = 95, memory_threshold: float = 95,
+                 wait_timeout: float = 60, peer_timeout: float = 1,
+                 maintenance: bool = False, cluster_token: str = '') -> None:
+        self.base_url = normalize_url(base_url)
+        self.server_id = server_id
+        self.peers = list(dict.fromkeys(normalize_url(p) for p in peers or []
+                                       if normalize_url(p) != self.base_url))
+        self.verify = verify
+        self.cpu_threshold, self.memory_threshold = cpu_threshold, memory_threshold
+        self.wait_timeout, self.peer_timeout = wait_timeout, peer_timeout
+        self.maintenance, self.cluster_token = maintenance, cluster_token
+        self.ffmpeg = ffmpeg_executable()
+        self.library = MusicLibrary(music_dir)
+        self.library.scan()
+        self.lock = threading.RLock()
+        self.dispatch_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.wake = threading.Event()
         self.sessions: dict[str, StreamSession] = {}
-        self.current_session_by_client: dict[ClientAddress, str] = {}
-        self.latest_request_by_client: dict[ClientAddress, str] = {}
-        self.known_clients: set[ClientAddress] = set()
-        self.stream_threads: set[threading.Thread] = set()
-        self.dispatch_threads: set[threading.Thread] = set()
-        self.active_stream_count = 0
+        self.tickets: dict[str, PendingRequest] = {}
+        self.pending: deque[str] = deque()
+        self.node_cache: dict[str, dict] = {}
+        self.cpu_percent = 0.0
+        self.memory_percent = psutil.virtual_memory().percent
+        self.app = Flask(__name__)
+        self.app.config['MAX_CONTENT_LENGTH'] = 16 * 1024
+        self._routes()
+        self.worker = threading.Thread(target=self._maintenance_loop, daemon=True,
+                                       name=f'fifo-resources-{server_id}')
+        self.worker.start()
 
-        # Cola FIFO de solicitudes que no pudieron ser asignadas de inmediato.
-        self.pending_queue: deque[str] = deque()
-        self.queued_requests: dict[str, QueuedRequest] = {}
-        self.queued_request_by_client: dict[ClientAddress, str] = {}
+    def resource_status(self) -> dict:
+        with self.lock:
+            active = sum(s.state in {'reserved', 'streaming'} for s in self.sessions.values())
+            cpu, memory = self.cpu_percent, self.memory_percent
+            accepting = not self.maintenance and cpu < self.cpu_threshold and memory < self.memory_threshold
+        return {'accepting': accepting, 'active_streams': active,
+                'cpu_percent': round(cpu, 1), 'memory_percent': round(memory, 1),
+                'cpu_threshold': self.cpu_threshold, 'memory_threshold': self.memory_threshold,
+                'maintenance': self.maintenance}
 
-        # Sondeos servidor-servidor. El receptor UDP llena estas respuestas y despierta al hilo que pidió capacidad.
-        self.capacity_probes: dict[str, CapacityProbe] = {}
+    def node_info(self) -> dict:
+        return {'server_id': self.server_id, 'base_url': self.base_url, 'peers': self.peers,
+                'resources': self.resource_status(), 'songs': self.library.public_catalog()}
 
-        self.queue_dispatcher = threading.Thread(
-            target=self._queue_dispatch_loop,
-            name=f"queue-dispatcher-{self.server_id}",
-            daemon=True,
-        )
+    def _http(self, method: str, url: str, **kwargs) -> requests.Response:
+        headers = {'X-Cluster-Token': self.cluster_token} if self.cluster_token else {}
+        return requests.request(method, url, timeout=(self.peer_timeout, self.peer_timeout),
+                                verify=self.verify, headers=headers, **kwargs)
 
-    # ------------------------------------------------------------------
-    # Ciclo principal
-    # ------------------------------------------------------------------
-
-    def serve_forever(self) -> None:
-        songs = self.library.scan()
-        self.queue_dispatcher.start()
-
-        print(f"SoundFlow Server P4 [{self.server_id}] escuchando UDP en {self.host}:{self.port}")
-        print(f"Dirección anunciada a clientes: {self.advertise_host}:{self.port}")
-        print(f"Biblioteca: {self.music_dir.resolve()} ({len(songs)} canción(es))")
-        print(f"Capacidad local: {self.max_streams} streams simultáneos")
-        if self.peer_addresses:
-            peers = ", ".join(f"{host}:{port}" for host, port in self.peer_addresses)
-            print(f"Servidores pares: {peers}")
-        else:
-            print("Servidores pares: ninguno (funciona como un único servidor)")
-        print(
-            "Modelo: receptor UDP + thread-per-stream + Semaphore + RLock + "
-            "Queue/Event + balanceo entre servidores + cola FIFO"
-        )
-        print("Ctrl+C para detener.\n")
-
-        try:
-            while not self.shutdown_event.is_set():
-                try:
-                    data, address = self.socket.recvfrom(65535)
-                except socket.timeout:
-                    continue
-                except OSError:
-                    break
-
-                message = decode_json(data)
-                if message is None:
-                    continue
-
-                msg_type = str(message.get("type", ""))
-                if msg_type.startswith("cluster_"):
-                    self._handle_cluster_message(message, address)
-                    continue
-
-                with self.state_lock:
-                    self.known_clients.add(address)
-
-                self._handle_client_message(message, address)
-        except KeyboardInterrupt:
-            print("\nCerrando servidor...")
-        finally:
-            self.close()
-
-    def close(self) -> None:
-        if self.shutdown_event.is_set():
-            return
-
-        self.shutdown_event.set()
-        with self.queue_condition:
-            sessions = list(self.sessions.values())
-            stream_threads = list(self.stream_threads)
-            dispatch_threads = list(self.dispatch_threads)
-            probes = list(self.capacity_probes.values())
-            self.queue_condition.notify_all()
-
-        for session in sessions:
-            session.cancel_event.set()
-        for probe in probes:
-            probe.event.set()
-
-        try:
-            self.socket.close()
-        except OSError:
-            pass
-
-        for thread in stream_threads + dispatch_threads:
-            if thread is not threading.current_thread():
-                thread.join(timeout=1.0)
-
-        if self.queue_dispatcher.is_alive() and self.queue_dispatcher is not threading.current_thread():
-            self.queue_dispatcher.join(timeout=1.0)
-
-    # ------------------------------------------------------------------
-    # Mensajes de clientes
-    # ------------------------------------------------------------------
-
-    def _handle_client_message(self, message: dict[str, Any], client: ClientAddress) -> None:
-        msg_type = message.get("type")
-
-        if msg_type == "catalog_request":
-            self._handle_catalog_request(client)
-
-        elif msg_type == "stream_request":
-            song_id = Path(str(message.get("song_id", ""))).name
-            request_id = str(message.get("request_id") or uuid.uuid4())
-            raw_visited = message.get("visited_server_ids", [])
-            visited = tuple(str(item) for item in raw_visited if isinstance(item, str))
-            self._handle_stream_request(song_id, request_id, visited, client)
-
-        elif msg_type == "ack":
-            self._handle_ack(message, client)
-
-        elif msg_type == "cancel_stream":
-            session_id = str(message.get("session_id", ""))
-            self._cancel_session(session_id, client)
-
-        elif msg_type == "cancel_request":
-            request_id = str(message.get("request_id", ""))
-            self._cancel_pending_request(request_id, client)
-
-        elif msg_type == "disconnect":
-            self._disconnect_client(client)
-
-        elif msg_type == "ping":
-            self._send_json(
-                {
-                    "type": "pong",
-                    "server_id": self.server_id,
-                    "active_streams": self._active_stream_count(),
-                    "capacity": self.max_streams,
-                },
-                client,
-            )
-
-    def _handle_catalog_request(self, client: ClientAddress) -> None:
-        songs = self.library.all()
-        payload = []
-        for song in songs:
-            item = song.to_dict()
-            item["path"] = song.filename
-            payload.append(item)
-
-        self._send_json(
-            {
-                "type": "catalog",
-                "songs": payload,
-                "server_id": self.server_id,
-            },
-            client,
-        )
-        print(
-            f"{self._client_label(client)} catálogo solicitado a {self.server_id} "
-            f"({len(payload)} canciones) | clientes conocidos={self._known_client_count()}"
-        )
-
-    def _handle_stream_request(self, song_id: str, request_id: str, visited_server_ids: tuple[str, ...], client: ClientAddress,) -> None:
-        if not self._song_exists(song_id):
-            self._send_json(
-                {
-                    "type": "error",
-                    "request_id": request_id,
-                    "message": f"No existe '{song_id}' en el servidor {self.server_id}.",
-                },
-                client,
-            )
-            return
-
-        # Una nueva solicitud del mismo cliente sustituye su espera anterior y cancela únicamente su transferencia activa previa.
-        with self.queue_condition:
-            old_request = self.latest_request_by_client.get(client)
-            self.latest_request_by_client[client] = request_id
-            if old_request and old_request != request_id:
-                self._remove_queued_request_locked(old_request)
-
-            old_session_id = self.current_session_by_client.get(client)
-            old_session = self.sessions.get(old_session_id) if old_session_id else None
-            if old_session is not None:
-                old_session.cancel_event.set()
-
-        visited = tuple(dict.fromkeys((*visited_server_ids, self.server_id)))
-
-        # Reserva atómica del semáforo: evita que dos solicitudes observen el mismo hueco y lo ocupen simultáneamente.
-        if self._try_reserve_stream_slot():
-            self._start_stream_reserved(song_id, request_id, visited, client)
-            return
-
-        # No se bloquea el receptor mientras se consulta a otros servidores.
-        thread = threading.Thread(
-            target=self._dispatch_or_queue_worker,
-            args=(song_id, request_id, visited, client),
-            name=f"dispatch-{client[1]}-{request_id[:8]}",
-            daemon=True,
-        )
-        with self.state_lock:
-            self.dispatch_threads.add(thread)
-        thread.start()
-
-    def _handle_ack(self, message: dict[str, Any], client: ClientAddress) -> None:
-        session_id = str(message.get("session_id", ""))
-        try:
-            seq = int(message.get("seq"))
-        except (TypeError, ValueError):
-            return
-
-        with self.state_lock:
-            session = self.sessions.get(session_id)
-
-        if session is None or session.client != client:
-            return
-
-        session.ack_queue.put(seq)
-
-    def _cancel_session(self, session_id: str, client: ClientAddress) -> None:
-        with self.state_lock:
-            session = self.sessions.get(session_id)
-
-        if session is not None and session.client == client:
-            session.cancel_event.set()
-
-    def _cancel_pending_request(self, request_id: str, client: ClientAddress) -> None:
-        with self.queue_condition:
-            if self.latest_request_by_client.get(client) == request_id:
-                self.latest_request_by_client.pop(client, None)
-            queued = self.queued_requests.get(request_id)
-            if queued is not None and queued.client == client:
-                self._remove_queued_request_locked(request_id)
-            self.queue_condition.notify_all()
-
-    def _disconnect_client(self, client: ClientAddress) -> None:
-        with self.queue_condition:
-            session_id = self.current_session_by_client.get(client)
-            session = self.sessions.get(session_id) if session_id else None
-            request_id = self.latest_request_by_client.pop(client, None)
-            if request_id:
-                self._remove_queued_request_locked(request_id)
-            self.known_clients.discard(client)
-            self.queue_condition.notify_all()
-
-        if session is not None:
-            session.cancel_event.set()
-
-        print(f"{self._client_label(client)} cliente desconectado de {self.server_id}")
-
-    # ------------------------------------------------------------------
-    # Balanceo entre servidores
-    # ------------------------------------------------------------------
-
-    def _dispatch_or_queue_worker(self, song_id: str, request_id: str, visited_server_ids: tuple[str, ...], client: ClientAddress,) -> None:
-        try:
-            if not self._is_current_request(client, request_id):
-                return
-
-            target = self._probe_peers_for_capacity(song_id, set(visited_server_ids))
-            if target is not None and self._is_current_request(client, request_id):
-                self._send_redirect(request_id, visited_server_ids, target, client)
-                return
-
-            if self._is_current_request(client, request_id):
-                self._enqueue_request(song_id, request_id, visited_server_ids, client)
-        finally:
-            current = threading.current_thread()
-            with self.state_lock:
-                self.dispatch_threads.discard(current)
-
-    def _probe_peers_for_capacity(self, song_id: str, excluded_server_ids: set[str],) -> dict[str, Any] | None:
-        if not self.peer_addresses or self.shutdown_event.is_set():
-            return None
-
-        probe_id = str(uuid.uuid4())
-        probe = CapacityProbe(expected=set(self.peer_addresses))
-        with self.state_lock:
-            self.capacity_probes[probe_id] = probe
-
-        message = {
-            "type": self.CLUSTER_CAPACITY_REQUEST,
-            "probe_id": probe_id,
-            "requester_id": self.server_id,
-            "song_id": song_id,
-        }
-        for peer in self.peer_addresses:
-            self._send_json(message, peer)
-
-        probe.event.wait(timeout=self.probe_timeout)
-
-        with self.state_lock:
-            finished = self.capacity_probes.pop(probe_id, probe)
-            responses = list(finished.responses.items())
-
-        candidates: list[dict[str, Any]] = []
-        for source, response in responses:
-            server_id = str(response.get("server_id", ""))
-            if not server_id or server_id in excluded_server_ids:
+    def discover(self) -> tuple[list[dict], list[str]]:
+        """BFS de nodos. /api/node es local: no hay llamadas recursivas ni ciclos."""
+        local = self.node_info()
+        nodes = [local]
+        offline: list[str] = []
+        todo = deque(self.peers)
+        visited = {self.base_url}
+        while todo and not self.stop_event.is_set():
+            url = todo.popleft()
+            if url in visited:
                 continue
-            if not bool(response.get("has_song", False)):
-                continue
+            visited.add(url)
             try:
-                available = int(response.get("available", 0))
-                active = int(response.get("active_streams", 0))
-                capacity = max(1, int(response.get("capacity", 1)))
-                queued = max(0, int(response.get("queued", 0)))
-                target_port = int(response.get("port", source[1]))
-            except (TypeError, ValueError):
-                continue
-            if available <= 0:
-                continue
+                response = self._http('GET', url + '/api/node')
+                response.raise_for_status()
+                node = response.json()
+                if not isinstance(node, dict) or not isinstance(node.get('songs'), list):
+                    raise ValueError('Respuesta de nodo inválida')
+                # Se usa la URL alcanzada; evita confiar en una dirección anunciada errónea.
+                node['base_url'] = url
+                nodes.append(node)
+                with self.lock:
+                    self.node_cache[url] = node
+                for peer in node.get('peers', []):
+                    normalized = normalize_url(peer)
+                    if normalized not in visited:
+                        todo.append(normalized)
+            except (requests.RequestException, ValueError, KeyError, TypeError):
+                offline.append(url)
+                # Se conservan las conexiones conocidas de nodos que ahora estén caídos.
+                with self.lock:
+                    previous = self.node_cache.get(url, {})
+                for peer in previous.get('peers', []):
+                    try:
+                        normalized = normalize_url(peer)
+                        if normalized not in visited:
+                            todo.append(normalized)
+                    except ValueError:
+                        pass
+        return nodes, offline
 
-            candidates.append(
-                {
-                    "server_id": server_id,
-                    "host": str(response.get("advertise_host") or source[0]),
-                    "port": target_port,
-                    "active_streams": active,
-                    "capacity": capacity,
-                    "available": available,
-                    "queued": queued,
-                    "utilization": active / capacity,
-                }
-            )
-
-        if not candidates:
-            return None
-
-        # Least-loaded: menor utilización, luego menor cola y finalmente menor cantidad de streams activos para tener un desempate determinista.
-        return min(
-            candidates,
-            key=lambda item: (
-                float(item["utilization"]),
-                int(item["queued"]),
-                int(item["active_streams"]),
-                str(item["server_id"]),
-            ),
-        )
-
-    def _handle_cluster_message(self, message: dict[str, Any], source: ClientAddress) -> None:
-        if source not in self.peer_addresses:
-            return
-
-        msg_type = message.get("type")
-        if msg_type == self.CLUSTER_CAPACITY_REQUEST:
-            probe_id = str(message.get("probe_id", ""))
-            song_id = Path(str(message.get("song_id", ""))).name
-            if not probe_id:
-                return
-
-            active = self._active_stream_count()
-            with self.state_lock:
-                queued = len(self.queued_requests)
-            self._send_json(
-                {
-                    "type": self.CLUSTER_CAPACITY_RESPONSE,
-                    "probe_id": probe_id,
-                    "server_id": self.server_id,
-                    "advertise_host": self.advertise_host,
-                    "port": self.port,
-                    "active_streams": active,
-                    "capacity": self.max_streams,
-                    "available": max(0, self.max_streams - active),
-                    "queued": queued,
-                    "has_song": self._song_exists(song_id),
-                },
-                source,
-            )
-
-        elif msg_type == self.CLUSTER_CAPACITY_RESPONSE:
-            probe_id = str(message.get("probe_id", ""))
-            with self.state_lock:
-                probe = self.capacity_probes.get(probe_id)
-                if probe is None or source not in probe.expected:
-                    return
-                probe.responses[source] = dict(message)
-                if probe.expected.issubset(probe.responses.keys()):
-                    probe.event.set()
-
-    def _send_redirect(self, request_id: str, visited_server_ids: tuple[str, ...], target: dict[str, Any], client: ClientAddress, ) -> None:
-        self._send_json(
-            {
-                "type": "redirect",
-                "request_id": request_id,
-                "from_server_id": self.server_id,
-                "target_server_id": target["server_id"],
-                "host": target["host"],
-                "port": target["port"],
-                "visited_server_ids": list(visited_server_ids),
-                "reason": "Servidor local sin capacidad; se seleccionó un servidor con menor carga.",
-            },
-            client,
-        )
-        with self.queue_condition:
-            if self.latest_request_by_client.get(client) == request_id:
-                self.latest_request_by_client.pop(client, None)
-            self._remove_queued_request_locked(request_id)
-            self.queue_condition.notify_all()
-
-        print(
-            f"{self._client_label(client)} request={request_id[:8]} redirigida "
-            f"{self.server_id} -> {target['server_id']} "
-            f"(carga {target['active_streams']}/{target['capacity']})"
-        )
-
-    # ------------------------------------------------------------------
-    # Cola FIFO de solicitudes pendientes
-    # ------------------------------------------------------------------
-
-    def _enqueue_request( song_id: str, request_id: str, visited_server_ids: tuple[str, ...], client: ClientAddress, ) -> None:
-        request = QueuedRequest(
-            request_id=request_id,
-            song_id=song_id,
-            client=client,
-            visited_server_ids=visited_server_ids,
-            created_at=time.monotonic(),
-        )
-
-        with self.queue_condition:
-            if self.latest_request_by_client.get(client) != request_id:
-                return
-
-            old = self.queued_request_by_client.get(client)
-            if old and old != request_id:
-                self._remove_queued_request_locked(old)
-
-            if request_id not in self.queued_requests:
-                self.queued_requests[request_id] = request
-                self.queued_request_by_client[client] = request_id
-                self.pending_queue.append(request_id)
-
-            position = self._queue_position_locked(request_id)
-            self.queue_condition.notify_all()
-
-        self._send_json(
-            {
-                "type": "stream_queued",
-                "request_id": request_id,
-                "server_id": self.server_id,
-                "position": position,
-                "message": (
-                    "Todos los servidores están ocupados temporalmente; "
-                    f"solicitud en cola FIFO (posición {position})."
-                ),
-            },
-            client,
-        )
-        print(
-            f"{self._client_label(client)} request={request_id[:8]} en cola FIFO "
-            f"de {self.server_id} | posición={position}"
-        )
-
-    def _queue_dispatch_loop(self) -> None:
-        while not self.shutdown_event.is_set():
-            with self.queue_condition:
-                request = self._peek_next_queued_locked()
-                if request is None:
-                    self.queue_condition.wait(timeout=0.50)
+    def catalog(self) -> dict:
+        nodes, offline = self.discover()
+        sources = [(node, True) for node in nodes]
+        with self.lock:
+            sources += [(self.node_cache[url], False) for url in offline if url in self.node_cache]
+        songs: dict[str, dict] = {}
+        for node, available in sources:
+            for item in node['songs']:
+                song_id = item.get('id')
+                if not isinstance(song_id, str):
                     continue
+                if song_id not in songs:
+                    songs[song_id] = {**item, 'servers': [], 'available': False}
+                song = songs[song_id]
+                if node['server_id'] not in song['servers']:
+                    song['servers'].append(node['server_id'])
+                song['available'] |= available
+        return {'songs': sorted(songs.values(), key=lambda s: s['title'].casefold()),
+                'nodes': [{'server_id': n['server_id'], 'base_url': n['base_url'],
+                           'resources': n['resources'], 'song_count': len(n['songs'])} for n in nodes],
+                'offline': offline}
 
-            if not self._is_current_request(request.client, request.request_id):
-                with self.queue_condition:
-                    self._remove_queued_request_locked(request.request_id)
-                continue
+    def _reserve(self, song_id: str, start: float) -> tuple[dict, int]:
+        song = self.library.get(song_id)
+        if song is None:
+            return {'error': 'Este nodo no tiene la canción.'}, 404
+        if song.duration > 0 and start >= song.duration:
+            return {'error': 'El segundo solicitado excede la duración.'}, 400
+        with self.lock:
+            if not self.resource_status()['accepting']:
+                return {'error': 'Nodo temporalmente ocupado por recursos o mantenimiento.'}, 503
+            session = StreamSession(uuid.uuid4().hex, song_id, start)
+            self.sessions[session.id] = session
+        result = {'stream_id': session.id, 'server_id': self.server_id, 'server_url': self.base_url,
+                  'audio_url': self.base_url + f'/api/streams/{session.id}/audio',
+                  'song_id': song_id, 'start': start, 'duration': song.duration,
+                  'sample_rate': SAMPLE_RATE, 'channels': CHANNELS, 'sample_bytes': 2}
+        log.info('RESERVA %s canción=%s inicio=%.2fs nodo=%s', session.id[:8], song.title, start, self.server_id)
+        return result, 201
 
-            # Primero se respeta capacidad local: si se liberó un slot, la solicitud más antigua entra inmediatamente.
-            if self._try_reserve_stream_slot():
-                if self._claim_queued_request(request.request_id):
-                    self._start_stream_reserved(
-                        request.song_id,
-                        request.request_id,
-                        request.visited_server_ids,
-                        request.client,
-                    )
+    def _attempt(self, ticket: PendingRequest) -> bool:
+        nodes, offline = self.discover()
+        holders = [node for node in nodes if any(s.get('id') == ticket.song_id for s in node['songs'])]
+        candidates = sorted((n for n in holders if n['resources'].get('accepting')),
+                            key=lambda n: (n['resources']['active_streams'],
+                                           n['resources']['cpu_percent'], n['resources']['memory_percent']))
+        transient = False
+        for node in candidates:
+            with self.lock:
+                if ticket.state != 'waiting':
+                    return True
+            try:
+                if node['base_url'] == self.base_url:
+                    data, status = self._reserve(ticket.song_id, ticket.start)
                 else:
-                    self._release_stream_slot()
-                continue
+                    response = self._http('POST', node['base_url'] + '/api/internal/streams',
+                                          json={'song_id': ticket.song_id, 'start': ticket.start})
+                    status, data = response.status_code, response.json()
+                if status == 400:
+                    with self.lock:
+                        ticket.state, ticket.reason, ticket.error_code = 'failed', data.get('error', 'Solicitud inválida.'), 400
+                    return True
+                if status != 201:
+                    transient = True
+                    continue
+                data['server_url'] = node['base_url']
+                data['audio_url'] = node['base_url'] + f"/api/streams/{data['stream_id']}/audio"
+                with self.lock:
+                    cancelled = ticket.state != 'waiting'
+                    if not cancelled:
+                        ticket.state, ticket.stream = 'ready', data
+                        ticket.reason = 'Solicitud asignada a ' + data['server_id']
+                if cancelled:
+                    self._cancel_assignment(data)
+                else:
+                    log.info('ASIGNACION solicitud=%s destino=%s', ticket.id[:8], data['server_id'])
+                return True
+            except (requests.RequestException, ValueError, KeyError):
+                transient = True
+        with self.lock:
+            if ticket.state != 'waiting':
+                return True
+            if not holders and not offline and not transient:
+                ticket.state, ticket.error_code = 'failed', 404
+                ticket.reason = 'La canción no existe en los servidores disponibles.'
+                return True
+            ticket.reason = ('Los nodos con la canción están ocupados; esperando recursos.' if holders else
+                             'No se puede contactar al servidor con la canción; esperando reconexión.')
+        return False
 
-            # Si seguimos llenos, el servidor vuelve a actuar como solicitante de recursos y pregunta por capacidad para la cabeza de la cola.
-            target = self._probe_peers_for_capacity(
-                request.song_id,
-                set(request.visited_server_ids),
-            )
-            if target is not None and self._claim_queued_request(request.request_id):
-                if self._is_current_request(request.client, request.request_id):
-                    self._send_redirect(
-                        request.request_id,
-                        request.visited_server_ids,
-                        target,
-                        request.client,
-                    )
-                continue
-
-            with self.queue_condition:
-                self.queue_condition.wait(timeout=0.50)
-
-    def _peek_next_queued_locked(self) -> QueuedRequest | None:
-        while self.pending_queue:
-            request_id = self.pending_queue[0]
-            request = self.queued_requests.get(request_id)
-            if request is not None:
-                return request
-            self.pending_queue.popleft()
-        return None
-
-    def _claim_queued_request(self, request_id: str) -> bool:
-        with self.queue_condition:
-            request = self.queued_requests.get(request_id)
-            if request is None:
-                return False
-            self._remove_queued_request_locked(request_id)
-            return True
-
-    def _remove_queued_request_locked(self, request_id: str) -> None:
-        request = self.queued_requests.pop(request_id, None)
-        if request is None:
+    def dispatch_once(self) -> None:
+        if not self.dispatch_lock.acquire(blocking=False):
             return
-        if self.queued_request_by_client.get(request.client) == request_id:
-            self.queued_request_by_client.pop(request.client, None)
-        # El id se elimina perezosamente del deque en _peek_next_queued_locked.
-
-    def _queue_position_locked(self, request_id: str) -> int:
-        position = 0
-        for queued_id in self.pending_queue:
-            if queued_id not in self.queued_requests:
-                continue
-            position += 1
-            if queued_id == request_id:
-                return position
-        return max(1, position)
-
-    # ------------------------------------------------------------------
-    # Streaming concurrente local
-    # ------------------------------------------------------------------
-
-    def _start_stream_reserved( self, song_id: str, request_id: str, visited_server_ids: tuple[str, ...], client: ClientAddress, ) -> None:
-        # El slot ya fue reservado antes de entrar aquí.
-        if not self._is_current_request(client, request_id):
-            self._release_stream_slot()
-            return
-
-        path = (self.music_dir / song_id).resolve()
         try:
-            path.relative_to(self.music_dir.resolve())
-        except ValueError:
-            self._release_stream_slot()
-            self._send_json(
-                {"type": "error", "request_id": request_id, "message": "Canción inválida."},
-                client,
-            )
-            return
-
-        songs = {song.filename: song for song in self.library.all()}
-        song = songs.get(song_id)
-        if song is None or not path.is_file():
-            self._release_stream_slot()
-            self._send_json(
-                {
-                    "type": "error",
-                    "request_id": request_id,
-                    "message": f"No existe '{song_id}' en el servidor.",
-                },
-                client,
-            )
-            return
-
-        session_id = str(uuid.uuid4())
-        session = StreamSession(
-            session_id=session_id,
-            request_id=request_id,
-            client=client,
-            path=path,
-            ack_queue=queue.Queue(),
-            cancel_event=threading.Event(),
-            created_at=time.monotonic(),
-        )
-
-        with self.queue_condition:
-            if self.latest_request_by_client.get(client) != request_id:
-                self._release_stream_slot()
-                return
-
-            old_session_id = self.current_session_by_client.get(client)
-            old_session = self.sessions.get(old_session_id) if old_session_id else None
-            if old_session is not None:
-                old_session.cancel_event.set()
-
-            self.sessions[session_id] = session
-            self.current_session_by_client[client] = session_id
-            self._remove_queued_request_locked(request_id)
-
-        file_size = path.stat().st_size
-        total_chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
-        song_payload = song.to_dict()
-        song_payload["path"] = song.filename
-
-        self._send_json(
-            {
-                "type": "stream_start",
-                "request_id": request_id,
-                "session_id": session_id,
-                "server_id": self.server_id,
-                "song": song_payload,
-                "file_size": file_size,
-                "total_chunks": total_chunks,
-                "chunk_size": CHUNK_SIZE,
-            },
-            client,
-        )
-
-        thread = threading.Thread(
-            target=self._stream_worker,
-            args=(session, total_chunks),
-            name=f"stream-{client[1]}-{session_id[:8]}",
-            daemon=True,
-        )
-
-        with self.state_lock:
-            self.stream_threads.add(thread)
-            active_sessions = len(self.sessions)
-            local_load = self.active_stream_count
-
-        print(
-            f"{self._client_label(client)} request={request_id[:8]} sesión={session_id[:8]} "
-            f"atendida por {self.server_id}: '{song.filename}' "
-            f"({file_size} bytes, {total_chunks} fragmentos) | "
-            f"carga local={local_load}/{self.max_streams} | sesiones={active_sessions}"
-        )
-        thread.start()
-
-    def _stream_worker(self, session: StreamSession, total_chunks: int) -> None:
-        session_id = session.session_id
-        client = session.client
-        path = session.path
-        session_bytes = uuid.UUID(session_id).bytes
-        max_retries = 10
-        timeout = 0.50
-
-        try:
-            print(
-                f"{self._client_label(client)} sesión={session_id[:8]} "
-                f"worker={threading.current_thread().name} inició transferencia en {self.server_id}"
-            )
-
-            with path.open("rb") as source:
-                for seq in range(total_chunks):
-                    if self.shutdown_event.is_set() or session.cancel_event.is_set():
-                        self._send_json(
-                            {
-                                "type": "stream_cancelled",
-                                "request_id": session.request_id,
-                                "session_id": session_id,
-                                "server_id": self.server_id,
-                            },
-                            client,
-                        )
-                        return
-
-                    payload = source.read(CHUNK_SIZE)
-                    packet = pack_audio_chunk(session_bytes, seq, total_chunks, payload)
-                    acknowledged = False
-
-                    for attempt in range(1, max_retries + 1):
-                        if self.shutdown_event.is_set() or session.cancel_event.is_set():
-                            return
-
-                        self._send_packet(packet, client)
-
-                        deadline = time.monotonic() + timeout
-                        while time.monotonic() < deadline:
-                            remaining = deadline - time.monotonic()
-                            try:
-                                ack_seq = session.ack_queue.get(timeout=max(0.001, remaining))
-                            except queue.Empty:
-                                break
-
-                            if ack_seq == seq:
-                                acknowledged = True
-                                break
-
-                        if acknowledged:
-                            break
-
-                        print(
-                            f"  {self._client_label(client)} sesión={session_id[:8]} "
-                            f"timeout seq={seq}, reintento {attempt}/{max_retries}"
-                        )
-
-                    if not acknowledged:
-                        self._send_json(
-                            {
-                                "type": "error",
-                                "request_id": session.request_id,
-                                "message": (
-                                    "Transferencia abortada: no llegó ACK del "
-                                    f"fragmento {seq}."
-                                ),
-                            },
-                            client,
-                        )
-                        return
-
-            elapsed = time.monotonic() - session.created_at
-            print(
-                f"{self._client_label(client)} sesión={session_id[:8]} "
-                f"transferencia completa en {self.server_id}: {path.name} ({elapsed:.2f}s)"
-            )
-
-        except OSError as exc:
-            self._send_json(
-                {
-                    "type": "error",
-                    "request_id": session.request_id,
-                    "message": f"Error leyendo la canción: {exc}",
-                },
-                client,
-            )
+            # Orden global FIFO: una nueva solicitud no adelanta a la primera pendiente.
+            while not self.stop_event.is_set():
+                with self.lock:
+                    while self.pending and self.tickets[self.pending[0]].state != 'waiting':
+                        self.pending.popleft()
+                    if not self.pending:
+                        break
+                    ticket = self.tickets[self.pending[0]]
+                    if time.monotonic() - ticket.created >= self.wait_timeout:
+                        ticket.state, ticket.error_code = 'failed', 504
+                        ticket.reason = 'Se agotó el tiempo de espera. Puedes volver a intentar.'
+                        continue
+                if not self._attempt(ticket):
+                    break
         finally:
-            current_thread = threading.current_thread()
-            with self.queue_condition:
-                self.sessions.pop(session_id, None)
-                if self.current_session_by_client.get(client) == session_id:
-                    self.current_session_by_client.pop(client, None)
-                if self.latest_request_by_client.get(client) == session.request_id:
-                    self.latest_request_by_client.pop(client, None)
-                self.stream_threads.discard(current_thread)
-                active_sessions = len(self.sessions)
+            self.dispatch_lock.release()
 
-            self._release_stream_slot()
-            print(
-                f"{self._client_label(client)} sesión={session_id[:8]} cerrada en {self.server_id} "
-                f"| sesiones activas={active_sessions} | carga={self._active_stream_count()}/{self.max_streams}"
-            )
+    def _maintenance_loop(self) -> None:
+        psutil.cpu_percent(interval=None)
+        while not self.stop_event.is_set():
+            with self.lock:
+                self.cpu_percent = psutil.cpu_percent(interval=None)
+                self.memory_percent = psutil.virtual_memory().percent
+                now = time.monotonic()
+                for session in self.sessions.values():
+                    if session.state == 'reserved' and now - session.created > 30:
+                        session.state, session.finished = 'expired', now
+                for sid in [sid for sid, s in self.sessions.items() if s.finished and now - s.finished > 120]:
+                    del self.sessions[sid]
+                queued = set(self.pending)
+                for tid in [tid for tid, t in self.tickets.items()
+                            if tid not in queued and t.state != 'waiting' and now - t.created > 600]:
+                    del self.tickets[tid]
+            self.dispatch_once()
+            self.wake.wait(1)
+            self.wake.clear()
 
-    # ------------------------------------------------------------------
-    # Capacidad, socket compartido y utilidades
-    # ------------------------------------------------------------------
+    def ticket_data(self, ticket: PendingRequest) -> dict:
+        with self.lock:
+            active = [tid for tid in self.pending if self.tickets[tid].state == 'waiting']
+            position = active.index(ticket.id) + 1 if ticket.id in active else 0
+            return {'request_id': ticket.id, 'state': ticket.state, 'song_id': ticket.song_id,
+                    'position': position, 'message': ticket.reason, 'stream': ticket.stream,
+                    'error_code': ticket.error_code, 'wait_timeout': self.wait_timeout}
 
-    def _try_reserve_stream_slot(self) -> bool:
-        acquired = self.stream_slots.acquire(blocking=False)
-        if not acquired:
-            return False
-        with self.state_lock:
-            self.active_stream_count += 1
-        return True
-
-    def _release_stream_slot(self) -> None:
-        try:
-            self.stream_slots.release()
-        except ValueError:
-            return
-        with self.queue_condition:
-            self.active_stream_count = max(0, self.active_stream_count - 1)
-            self.queue_condition.notify_all()
-
-    def _active_stream_count(self) -> int:
-        with self.state_lock:
-            return self.active_stream_count
-
-    def _is_current_request(self, client: ClientAddress, request_id: str) -> bool:
-        with self.state_lock:
-            return self.latest_request_by_client.get(client) == request_id
-
-    def _song_exists(self, song_id: str) -> bool:
-        if not song_id:
-            return False
-        songs = {song.filename for song in self.library.all()}
-        return song_id in songs and (self.music_dir / song_id).is_file()
-
-    def _send_packet(self, data: bytes, destination: ClientAddress) -> None:
-        try:
-            with self.send_lock:
-                self.socket.sendto(data, destination)
-        except OSError:
-            pass
-
-    def _send_json(self, message: dict[str, Any], destination: ClientAddress) -> None:
-        self._send_packet(encode_json(message), destination)
-
-    def _known_client_count(self) -> int:
-        with self.state_lock:
-            return len(self.known_clients)
-
-    def _normalize_peers(self, peers: list[ClientAddress]) -> list[ClientAddress]:
-        normalized: list[ClientAddress] = []
-        seen: set[ClientAddress] = set()
-        try:
-            self_address = (socket.gethostbyname(self.advertise_host), int(self.port))
-        except OSError:
-            self_address = None
-
-        for host, port in peers:
+    def cancel_session(self, stream_id: str) -> None:
+        with self.lock:
+            session = self.sessions.get(stream_id)
+            if session is None:
+                return
+            if session.state not in {'reserved', 'streaming'}:
+                return
+            session.cancelled.set()
+            session.state, session.finished = 'cancelled', time.monotonic()
+            process = session.process
+        if process and process.poll() is None:
             try:
-                address = (socket.gethostbyname(host), int(port))
-            except (OSError, ValueError):
-                continue
-            if address == self_address or address in seen:
-                continue
-            seen.add(address)
-            normalized.append(address)
-        return normalized
+                process.terminate()
+            except OSError:
+                pass
+        self.wake.set()
+
+    def _cancel_assignment(self, stream: dict) -> None:
+        if stream['server_url'] == self.base_url:
+            self.cancel_session(stream['stream_id'])
+        else:
+            try:
+                self._http('DELETE', stream['server_url'] + f"/api/streams/{stream['stream_id']}")
+            except requests.RequestException:
+                pass
 
     @staticmethod
-    def _client_label(client: ClientAddress) -> str:
-        return f"[{client[0]}:{client[1]}]"
+    def _parse_body() -> tuple[str, float]:
+        value = request.get_json(silent=True)
+        if not isinstance(value, dict):
+            raise ValueError('Envía un objeto JSON con song_id y start opcional.')
+        song_id = value.get('song_id')
+        if not isinstance(song_id, str) or len(song_id) != 64 or any(c not in '0123456789abcdef' for c in song_id):
+            raise ValueError('song_id debe ser un identificador del catálogo.')
+        if isinstance(value.get('start', 0), bool):
+            raise ValueError('start debe ser un número de segundos.')
+        start = float(value.get('start', 0))
+        if not math.isfinite(start) or start < 0:
+            raise ValueError('start debe ser un número finito mayor o igual a cero.')
+        return song_id, start
+
+    def _audio_response(self, stream_id: str) -> Response | tuple:
+        with self.lock:
+            session = self.sessions.get(stream_id)
+            if session is None:
+                return jsonify(error='Sesión desconocida.'), 404
+            if session.state != 'reserved':
+                return jsonify(error='La sesión ya se usó, canceló o expiró.'), 410
+            song = self.library.get(session.song_id)
+            if song is None:
+                session.state, session.finished = 'failed', time.monotonic()
+                return jsonify(error='El archivo ya no está disponible.'), 404
+            # FFmpeg aplica búsqueda exacta y normaliza todos los formatos a PCM.
+            args = [self.ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error',
+                    '-ss', str(session.start), '-i', song.path, '-vn',
+                    '-acodec', 'pcm_s16le', '-ar', str(SAMPLE_RATE), '-ac', str(CHANNELS),
+                    '-f', 's16le', 'pipe:1']
+            errors = tempfile.TemporaryFile()
+            try:
+                process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=errors)
+            except OSError:
+                errors.close()
+                session.state, session.finished = 'failed', time.monotonic()
+                return jsonify(error='No se pudo iniciar el decodificador.'), 503
+            session.process, session.state = process, 'streaming'
+
+        def cleanup() -> None:
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    process.kill()
+                    process.wait()
+            if process.stdout:
+                process.stdout.close()
+            if not errors.closed:
+                errors.close()
+            with self.lock:
+                if session.state == 'streaming':
+                    session.state = 'completed' if process.returncode == 0 else 'failed'
+                session.finished = time.monotonic()
+            self.wake.set()
+
+        def generate():
+            count = 0
+            try:
+                while not session.cancelled.is_set():
+                    data = process.stdout.read(CHUNK_BYTES)
+                    if not data:
+                        break
+                    count += len(data)
+                    yield data
+                code = process.wait(timeout=3)
+                if code and not session.cancelled.is_set():
+                    errors.seek(0)
+                    message = errors.read(2048).decode(errors='replace')
+                    log.error('FFmpeg falló: %s', message)
+                    # Interrumpe HTTP: el cliente no confunde un archivo truncado con uno completo.
+                    raise RuntimeError('El decodificador interrumpió el audio.')
+                log.info('FIN stream=%s bytes=%s estado=%s', stream_id[:8], count, session.state)
+            finally:
+                cleanup()
+
+        response = Response(generate(), mimetype='application/octet-stream', headers={
+            'X-Audio-Format': 's16le', 'X-Sample-Rate': str(SAMPLE_RATE),
+            'X-Channels': str(CHANNELS), 'X-Audio-Start': str(session.start),
+            'X-Audio-Duration': str(song.duration), 'X-Server-ID': self.server_id,
+            'X-Estimated-Bytes': str(max(0, int((song.duration - session.start) * BYTES_PER_SECOND))),
+            'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'})
+        response.call_on_close(cleanup)
+        return response
+
+    def _routes(self) -> None:
+        app = self.app
+
+        @app.errorhandler(HTTPException)
+        def http_error(exc):
+            return jsonify(error=exc.description), exc.code
+
+        @app.errorhandler(ValueError)
+        @app.errorhandler(TypeError)
+        def invalid(exc):
+            return jsonify(error=str(exc)), 400
+
+        @app.get('/api/health')
+        def health():
+            return jsonify(server_id=self.server_id, status='ok', **self.resource_status())
+
+        @app.get('/api/node')
+        def node():
+            return jsonify(self.node_info())
+
+        @app.get('/api/catalog')
+        def catalog():
+            return jsonify(self.catalog())
+
+        @app.post('/api/requests')
+        def create_request():
+            song_id, start = self._parse_body()
+            ticket = PendingRequest(uuid.uuid4().hex, song_id, start)
+            with self.lock:
+                self.tickets[ticket.id] = ticket
+                self.pending.append(ticket.id)
+            self.dispatch_once()
+            self.wake.set()
+            data = self.ticket_data(ticket)
+            status = ticket.error_code if ticket.state == 'failed' else (201 if ticket.state == 'ready' else 202)
+            log.info('SOLICITUD %s estado=%s posición=%s', ticket.id[:8], ticket.state, data['position'])
+            return jsonify(data), status
+
+        @app.get('/api/requests/<request_id>')
+        def request_status(request_id):
+            with self.lock:
+                ticket = self.tickets.get(request_id)
+                if ticket is None:
+                    return jsonify(error='Solicitud desconocida.'), 404
+                return jsonify(self.ticket_data(ticket))
+
+        @app.delete('/api/requests/<request_id>')
+        def cancel_request(request_id):
+            with self.lock:
+                ticket = self.tickets.get(request_id)
+                if ticket is None:
+                    return jsonify(error='Solicitud desconocida.'), 404
+                ticket.state = 'cancelled'
+                stream = ticket.stream
+            if stream:
+                self._cancel_assignment(stream)
+            self.wake.set()
+            return '', 204
+
+        @app.post('/api/internal/streams')
+        def reserve_internal():
+            if self.cluster_token and not hmac.compare_digest(request.headers.get('X-Cluster-Token', ''), self.cluster_token):
+                return jsonify(error='Token del clúster inválido.'), 403
+            song_id, start = self._parse_body()
+            result, status = self._reserve(song_id, start)
+            return jsonify(result), status
+
+        @app.get('/api/streams/<stream_id>/audio')
+        def audio(stream_id):
+            return self._audio_response(stream_id)
+
+        @app.get('/api/streams/<stream_id>')
+        def stream_status(stream_id):
+            with self.lock:
+                session = self.sessions.get(stream_id)
+                if session is None:
+                    return jsonify(error='Sesión desconocida.'), 404
+                return jsonify(state=session.state, stream_id=session.id)
+
+        @app.delete('/api/streams/<stream_id>')
+        def cancel_stream(stream_id):
+            self.cancel_session(stream_id)
+            return '', 204
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.wake.set()
+        with self.lock:
+            ids = list(self.sessions)
+        for stream_id in ids:
+            self.cancel_session(stream_id)
+        self.worker.join(timeout=3)

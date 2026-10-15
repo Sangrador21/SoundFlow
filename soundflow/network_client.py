@@ -1,455 +1,238 @@
+"""Cliente REST en hilos: catálogo, FIFO, cancelación y audio PCM progresivo."""
 from __future__ import annotations
-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import queue
-import socket
 import threading
+import time
 import uuid
-from typing import Any
-
-from .protocol import BUFFER_THRESHOLD, decode_json, encode_json, unpack_audio_chunk
-
-
-ServerAddress = tuple[str, int]
+import requests
+from .audio import BYTES_PER_SECOND, FRAME_BYTES, CHUNK_BYTES, BUFFER_SECONDS
+from .http_utils import normalize_url
 
 
 @dataclass
-class _TransferState:
-    session_id: str
-    session_bytes: bytes
-    request_id: str
-    server: ServerAddress
-    song: dict[str, Any]
+class Transfer:
+    id: str
+    song: dict
+    start: float
     path: Path
-    file_size: int
-    total_chunks: int
-    file_handle: Any
-    expected_seq: int = 0
-    received_bytes: int = 0
-    ready_emitted: bool = False
+    cancel: threading.Event = field(default_factory=threading.Event)
+    coordinator: str = ''
+    ticket_id: str = ''
+    response: requests.Response | None = None
+    done: bool = False
 
 
-class SoundFlowUDPClient:
-
-    MAX_REDIRECTS = 8
-
-    def __init__(
-        self,
-        server_host: str,
-        server_port: int,
-        cache_dir: Path,
-        event_queue: queue.Queue[dict[str, Any]],
-    ) -> None:
-        self.server_lock = threading.RLock()
-        self.send_lock = threading.Lock()
-        self.request_lock = threading.RLock()
-        self.server = self._resolve_server(server_host, server_port)
-        self.entry_server = self.server
-
+class SoundFlowHTTPClient:
+    def __init__(self, base_url: str, cache_dir: Path, event_queue: queue.Queue,
+                 *, verify: bool | str = True, fallbacks: list[str] | None = None,
+                 wait_timeout: float = 90) -> None:
+        self.base_url = normalize_url(base_url)
+        self.urls = list(dict.fromkeys([self.base_url] + [normalize_url(v) for v in fallbacks or []]))
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.event_queue = event_queue
+        self.event_queue, self.verify, self.wait_timeout = event_queue, verify, wait_timeout
+        self.lock = threading.RLock()
+        self.transfer: Transfer | None = None
+        self.closed = threading.Event()
+        self.threads: list[threading.Thread] = []
+        self.catalog_sequence = 0
+        self.event_queue.put({'type': 'network_ready', 'server': self.base_url})
 
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind(("0.0.0.0", 0))
-        self.socket.settimeout(0.25)
+    def _spawn(self, target, *args) -> None:
+        thread = threading.Thread(target=target, args=args, daemon=True, name='http-' + target.__name__)
+        with self.lock:
+            self.threads = [t for t in self.threads if t.is_alive()]
+            self.threads.append(thread)
+        thread.start()
 
-        self.shutdown_event = threading.Event()
-        self.transfer_lock = threading.Lock()
-        self.transfer: _TransferState | None = None
+    def _http(self, method, url, **kwargs):
+        return requests.request(method, url, verify=self.verify, timeout=(2, 10), **kwargs)
 
-        self.pending_request_id: str | None = None
-        self.pending_song: dict[str, Any] | None = None
-        self.visited_server_ids: list[str] = []
-        self.redirect_count = 0
-
-        self.thread = threading.Thread(
-            target=self._receive_loop,
-            name="udp-receiver",
-            daemon=True,
-        )
-        self.thread.start()
-
-    @property
-    def local_address(self) -> tuple[str, int]:
-        host, port = self.socket.getsockname()
-        return str(host), int(port)
-
-    @property
-    def current_server(self) -> ServerAddress:
-        with self.server_lock:
-            return self.server
+    def _emit(self, state: Transfer, kind: str, **data) -> None:
+        if not state.cancel.is_set() and not self.closed.is_set():
+            self.event_queue.put({'type': kind, 'playback_id': state.id, **data})
 
     def request_catalog(self) -> None:
-        self._send_json({"type": "catalog_request"})
+        with self.lock:
+            self.catalog_sequence += 1
+            sequence = self.catalog_sequence
+        self._spawn(self._catalog, sequence)
 
-    def request_stream(self, song: dict[str, Any]) -> None:
+    def _catalog(self, sequence: int) -> None:
+        errors = []
+        with self.lock:
+            urls = list(self.urls)
+        for url in urls:
+            try:
+                response = self._http('GET', url + '/api/catalog')
+                response.raise_for_status()
+                data = response.json()
+                with self.lock:
+                    for node in data.get('nodes', []):
+                        known = normalize_url(node['base_url'])
+                        if known not in self.urls:
+                            self.urls.append(known)
+                    current = sequence == self.catalog_sequence
+                if current and not self.closed.is_set():
+                    self.event_queue.put({'type': 'catalog', **data, 'server': url})
+                return
+            except (requests.RequestException, ValueError, KeyError) as exc:
+                errors.append(f'{url}: {exc}')
+        if not self.closed.is_set():
+            self.event_queue.put({'type': 'catalog_error', 'message': 'No se pudo cargar el catálogo. ' + '\n'.join(errors)})
+
+    def request_stream(self, song: dict, start: float = 0.0) -> str:
         self.cancel_stream()
+        playback_id = uuid.uuid4().hex
+        state = Transfer(playback_id, dict(song), start, self.cache_dir / f'{playback_id}.pcm')
+        with self.lock:
+            self.transfer = state
+        self._spawn(self._download, state)
+        return playback_id
 
-        request_id = str(uuid.uuid4())
-        with self.request_lock:
-            self.pending_request_id = request_id
-            self.pending_song = dict(song)
-            self.visited_server_ids = []
-            self.redirect_count = 0
-
-        self._send_pending_stream_request()
-        self.event_queue.put(
-            {
-                "type": "network_status",
-                "message": f"Solicitando: {song.get('title', song.get('path', 'canción'))}",
-            }
-        )
+    def _cancel_ticket(self, state: Transfer) -> None:
+        if state.ticket_id and state.coordinator:
+            try:
+                self._http('DELETE', state.coordinator + '/api/requests/' + state.ticket_id)
+            except requests.RequestException:
+                pass
+            state.ticket_id = ''
 
     def cancel_stream(self) -> None:
-        with self.transfer_lock:
+        with self.lock:
             state = self.transfer
-            session_id = state.session_id if state else None
-            stream_server = state.server if state else None
-            self._close_transfer_locked(remove_partial=True)
+            self.transfer = None
+        if state:
+            state.cancel.set()
+            # La respuesta se cierra en su hilo lector; evita deadlock de urllib3.
+            self._spawn(self._cancel_ticket, state)
 
-        with self.request_lock:
-            request_id = self.pending_request_id
-            self.pending_request_id = None
-            self.pending_song = None
-            self.visited_server_ids = []
-            self.redirect_count = 0
+    def _acquire(self, state: Transfer, start: float, deadline: float) -> dict | None:
+        while time.monotonic() < deadline and not state.cancel.is_set():
+            with self.lock:
+                urls = list(self.urls)
+            for url in urls:
+                if state.cancel.is_set():
+                    return None
+                try:
+                    response = self._http('POST', url + '/api/requests', json={'song_id': state.song['id'], 'start': start})
+                    data = response.json()
+                    if response.status_code not in {201, 202}:
+                        message = data.get('message', data.get('error', 'Solicitud rechazada.'))
+                        if response.status_code in {400, 404}:
+                            raise ValueError(message)
+                        continue
+                    state.coordinator, state.ticket_id = url, data['request_id']
+                    while not state.cancel.is_set() and time.monotonic() < deadline:
+                        if data['state'] == 'ready':
+                            return data['stream']
+                        if data['state'] in {'failed', 'cancelled'}:
+                            raise ValueError(data.get('message', 'Solicitud cancelada.'))
+                        self._emit(state, 'stream_waiting', position=data.get('position', 0),
+                                   message=data.get('message', 'Esperando servidor.'))
+                        if state.cancel.wait(0.5):
+                            return None
+                        response = self._http('GET', url + '/api/requests/' + state.ticket_id)
+                        response.raise_for_status()
+                        data = response.json()
+                except requests.RequestException:
+                    self._cancel_ticket(state)
+                    continue
+            self._emit(state, 'stream_waiting', position=0, message='Servidor de entrada desconectado; buscando alternativa.')
+            state.cancel.wait(1)
+        if not state.cancel.is_set():
+            raise TimeoutError('Se agotó el tiempo de espera para atender la canción.')
+        return None
 
-        if session_id and stream_server:
-            self._send_json(
-                {"type": "cancel_stream", "session_id": session_id},
-                server=stream_server,
-            )
-        if request_id:
-            self._send_json({"type": "cancel_request", "request_id": request_id})
+    def _download(self, state: Transfer) -> None:
+        received, ready, last_emit = 0, False, 0.0
+        duration = float(state.song.get('duration', 0))
+        estimated = max(0, int((duration - state.start) * BYTES_PER_SECOND))
+        threshold = min(int(BUFFER_SECONDS * BYTES_PER_SECOND), estimated) if estimated else int(BUFFER_SECONDS * BYTES_PER_SECOND)
+        deadline = time.monotonic() + self.wait_timeout
+        try:
+            with state.path.open('wb') as handle:
+                while not state.cancel.is_set():
+                    stream = self._acquire(state, state.start + received / BYTES_PER_SECOND, deadline)
+                    if stream is None:
+                        return
+                    self._emit(state, 'stream_started', server=stream['server_url'], server_id=stream['server_id'],
+                               start=state.start, song=state.song)
+                    tail = b''
+                    try:
+                        with self._http('GET', stream['audio_url'], stream=True) as response:
+                            state.response = response
+                            response.raise_for_status()
+                            if (response.headers.get('X-Audio-Format') != 's16le'
+                                    or response.headers.get('X-Sample-Rate') != '44100'
+                                    or response.headers.get('X-Channels') != '2'):
+                                raise ValueError('Formato de audio incompatible.')
+                            for data in response.iter_content(chunk_size=CHUNK_BYTES):
+                                if state.cancel.is_set():
+                                    return
+                                # Mantiene muestras completas al reanudar en otro nodo.
+                                data = tail + data
+                                end = len(data) - len(data) % FRAME_BYTES
+                                tail = data[end:]
+                                if not end:
+                                    continue
+                                handle.write(data[:end])
+                                handle.flush()
+                                received += end
+                                now = time.monotonic()
+                                if now - last_emit >= 0.1:
+                                    self._emit(state, 'stream_progress', received=received, total=estimated,
+                                               buffered_until=state.start + received / BYTES_PER_SECOND)
+                                    last_emit = now
+                                if not ready and received >= threshold:
+                                    ready = True
+                                    self._emit(state, 'stream_ready', path=str(state.path), song=state.song,
+                                               start=state.start, complete=False)
+                            if tail:
+                                raise ValueError('La transferencia terminó en una muestra incompleta.')
+                        state.response = None
+                        check = self._http('GET', stream['server_url'] + '/api/streams/' + stream['stream_id'])
+                        check.raise_for_status()
+                        if check.json()['state'] != 'completed':
+                            raise requests.ConnectionError('El servidor no confirmó el final del audio.')
+                        if received == 0:
+                            raise ValueError('El archivo no contiene audio reproducible.')
+                        state.done = True
+                        if not ready:
+                            self._emit(state, 'stream_ready', path=str(state.path), song=state.song, start=state.start, complete=True)
+                        self._emit(state, 'stream_complete', received=received,
+                                   buffered_until=state.start + received / BYTES_PER_SECOND)
+                        return
+                    except requests.RequestException:
+                        state.response = None
+                        self._cancel_ticket(state)
+                        if state.cancel.is_set():
+                            return
+                        # Reanuda desde las muestras recibidas, sin duplicar ni borrar el búfer.
+                        self._emit(state, 'stream_waiting', position=0,
+                                   message='Transferencia interrumpida; buscando servidor para continuar.')
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('No se pudo recuperar la transferencia.')
+                        state.cancel.wait(1)
+        except (requests.RequestException, ValueError, KeyError, OSError, TimeoutError) as exc:
+            self._emit(state, 'network_error', message=str(exc))
+        finally:
+            state.response = None
+            self._cancel_ticket(state)
 
     def close(self) -> None:
+        self.closed.set()
         self.cancel_stream()
-        self._send_json({"type": "disconnect"})
-        self.shutdown_event.set()
-        self.thread.join(timeout=1.0)
-        try:
-            self.socket.close()
-        except OSError:
-            pass
-
-    def _send_pending_stream_request(self) -> None:
-        with self.request_lock:
-            request_id = self.pending_request_id
-            song = dict(self.pending_song) if self.pending_song else None
-            visited = list(self.visited_server_ids)
-        if not request_id or not song:
-            return
-
-        self._send_json(
-            {
-                "type": "stream_request",
-                "request_id": request_id,
-                "song_id": str(song.get("path", "")),
-                "visited_server_ids": visited,
-            }
-        )
-
-    def _send_json(
-        self,
-        message: dict[str, Any],
-        *,
-        server: ServerAddress | None = None,
-    ) -> None:
-        destination = server or self.current_server
-        try:
-            with self.send_lock:
-                self.socket.sendto(encode_json(message), destination)
-        except OSError as exc:
-            self.event_queue.put({"type": "network_error", "message": str(exc)})
-
-    def _receive_loop(self) -> None:
-        self.event_queue.put(
-            {
-                "type": "network_ready",
-                "server": self.current_server,
-                "local": self.local_address,
-            }
-        )
-        while not self.shutdown_event.is_set():
+        with self.lock:
+            threads = list(self.threads)
+        # Da tiempo a DELETE sin bloquear el cierre de la interfaz indefinidamente.
+        end = time.monotonic() + 2
+        for thread in threads:
+            thread.join(timeout=max(0, end - time.monotonic()))
+        for path in self.cache_dir.glob('*.pcm'):
             try:
-                data, address = self.socket.recvfrom(65535)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-
-            if not self._is_allowed_sender(address):
-                continue
-
-            chunk = unpack_audio_chunk(data)
-            if chunk is not None:
-                self._handle_audio_chunk(address, *chunk)
-                continue
-
-            message = decode_json(data)
-            if message is not None:
-                self._handle_control(message, address)
-
-    def _is_allowed_sender(self, address: ServerAddress) -> bool:
-        allowed = {self.current_server}
-        with self.transfer_lock:
-            if self.transfer is not None:
-                allowed.add(self.transfer.server)
-        return address in allowed
-
-    def _handle_control(self, message: dict[str, Any], source: ServerAddress) -> None:
-        msg_type = message.get("type")
-
-        if msg_type == "catalog":
-            self.event_queue.put(
-                {
-                    "type": "catalog",
-                    "songs": message.get("songs", []),
-                    "server_id": message.get("server_id"),
-                }
-            )
-
-        elif msg_type == "redirect":
-            self._handle_redirect(message, source)
-
-        elif msg_type == "stream_queued":
-            request_id = str(message.get("request_id", ""))
-            with self.request_lock:
-                if request_id != self.pending_request_id:
-                    return
-            self.event_queue.put(
-                {
-                    "type": "network_status",
-                    "message": str(
-                        message.get(
-                            "message",
-                            "Solicitud en espera de capacidad disponible.",
-                        )
-                    ),
-                }
-            )
-
-        elif msg_type == "stream_start":
-            self._begin_transfer(message, source)
-
-        elif msg_type == "stream_cancelled":
-            self.event_queue.put(
-                {
-                    "type": "network_status",
-                    "message": "Transferencia cancelada por el servidor.",
-                }
-            )
-
-        elif msg_type == "error":
-            request_id = str(message.get("request_id", ""))
-            with self.request_lock:
-                if request_id and self.pending_request_id and request_id != self.pending_request_id:
-                    return
-                if request_id == self.pending_request_id:
-                    self.pending_request_id = None
-                    self.pending_song = None
-            self.event_queue.put(
-                {
-                    "type": "network_error",
-                    "message": str(message.get("message", "Error del servidor")),
-                }
-            )
-
-        elif msg_type == "pong":
-            self.event_queue.put(
-                {
-                    "type": "network_status",
-                    "message": (
-                        f"Servidor {message.get('server_id', source)} disponible "
-                        f"({message.get('active_streams', '?')}/{message.get('capacity', '?')} streams)."
-                    ),
-                }
-            )
-
-    def _handle_redirect(self, message: dict[str, Any], source: ServerAddress) -> None:
-        request_id = str(message.get("request_id", ""))
-        with self.request_lock:
-            if request_id != self.pending_request_id or self.pending_song is None:
-                return
-            if self.redirect_count >= self.MAX_REDIRECTS:
-                self.pending_request_id = None
-                self.pending_song = None
-                self.event_queue.put(
-                    {
-                        "type": "network_error",
-                        "message": "Se alcanzó el máximo de redirecciones entre servidores.",
-                    }
-                )
-                return
-
-            try:
-                target = self._resolve_server(str(message["host"]), int(message["port"]))
-            except (KeyError, TypeError, ValueError, OSError):
-                self.event_queue.put(
-                    {"type": "network_error", "message": "Redirección de servidor inválida."}
-                )
-                return
-
-            visited = message.get("visited_server_ids", [])
-            self.visited_server_ids = [str(item) for item in visited if isinstance(item, str)]
-            self.redirect_count += 1
-
-        with self.server_lock:
-            self.server = target
-
-        self.event_queue.put(
-            {
-                "type": "network_server_changed",
-                "server": target,
-                "from_server_id": message.get("from_server_id"),
-                "target_server_id": message.get("target_server_id"),
-                "reason": message.get("reason"),
-            }
-        )
-        self._send_pending_stream_request()
-
-    def _begin_transfer(self, message: dict[str, Any], source: ServerAddress) -> None:
-        request_id = str(message.get("request_id", ""))
-        with self.request_lock:
-            if request_id and self.pending_request_id and request_id != self.pending_request_id:
-                return
-            self.pending_request_id = None
-            self.pending_song = None
-            self.visited_server_ids = []
-            self.redirect_count = 0
-
-        session_id = str(message["session_id"])
-        song = dict(message["song"])
-        total_chunks = int(message["total_chunks"])
-        file_size = int(message["file_size"])
-        suffix = Path(str(song.get("path", "audio.mp3"))).suffix or ".bin"
-        safe_name = f"stream_{session_id}{suffix}"
-        path = self.cache_dir / safe_name
-
-        with self.transfer_lock:
-            self._close_transfer_locked(remove_partial=True)
-            handle = path.open("wb")
-            self.transfer = _TransferState(
-                session_id=session_id,
-                session_bytes=uuid.UUID(session_id).bytes,
-                request_id=request_id,
-                server=source,
-                song=song,
-                path=path,
-                file_size=file_size,
-                total_chunks=total_chunks,
-                file_handle=handle,
-            )
-
-        self.event_queue.put(
-            {
-                "type": "stream_started",
-                "server": source,
-                "server_id": message.get("server_id"),
-                "song": song,
-                "file_size": file_size,
-                "total_chunks": total_chunks,
-                "path": str(path),
-            }
-        )
-
-    def _handle_audio_chunk(
-        self,
-        source: ServerAddress,
-        session_bytes: bytes,
-        seq: int,
-        total: int,
-        payload: bytes,
-    ) -> None:
-        with self.transfer_lock:
-            state = self.transfer
-            if state is None or state.session_bytes != session_bytes or state.server != source:
-                return
-
-            if seq == state.expected_seq:
-                state.file_handle.write(payload)
-                state.file_handle.flush()
-                state.received_bytes += len(payload)
-                state.expected_seq += 1
-            elif seq < state.expected_seq:
-                # ACK perdido: el servidor retransmitió un paquete ya escrito.
-                pass
-            else:
-                # Stop-and-Wait: no se aceptan fragmentos futuros.
-                return
-
-            self._send_json(
-                {"type": "ack", "session_id": state.session_id, "seq": seq},
-                server=state.server,
-            )
-
-            percent = (
-                state.received_bytes / state.file_size * 100.0
-                if state.file_size
-                else 100.0
-            )
-            self.event_queue.put(
-                {
-                    "type": "stream_progress",
-                    "received": state.received_bytes,
-                    "total": state.file_size,
-                    "percent": min(100.0, percent),
-                }
-            )
-
-            threshold = min(BUFFER_THRESHOLD, state.file_size)
-            if not state.ready_emitted and state.received_bytes >= threshold:
-                state.ready_emitted = True
-                self.event_queue.put(
-                    {
-                        "type": "stream_ready",
-                        "song": state.song,
-                        "path": str(state.path),
-                        "buffered": state.received_bytes,
-                        "threshold": threshold,
-                    }
-                )
-
-            if state.expected_seq >= state.total_chunks:
-                state.file_handle.close()
-                if not state.ready_emitted:
-                    state.ready_emitted = True
-                    self.event_queue.put(
-                        {
-                            "type": "stream_ready",
-                            "song": state.song,
-                            "path": str(state.path),
-                            "buffered": state.received_bytes,
-                            "threshold": threshold,
-                        }
-                    )
-                self.event_queue.put(
-                    {
-                        "type": "stream_complete",
-                        "song": state.song,
-                        "path": str(state.path),
-                        "bytes": state.received_bytes,
-                    }
-                )
-                self.transfer = None
-
-    def _close_transfer_locked(self, remove_partial: bool) -> None:
-        state = self.transfer
-        self.transfer = None
-        if state is None:
-            return
-        try:
-            state.file_handle.close()
-        except Exception:
-            pass
-        if remove_partial:
-            try:
-                state.path.unlink(missing_ok=True)
+                path.unlink()
             except OSError:
                 pass
-
-    @staticmethod
-    def _resolve_server(host: str, port: int) -> ServerAddress:
-        return socket.gethostbyname(host), int(port)
