@@ -35,3 +35,4 @@ htmlcov/
 __MACOSX/
 
 .demo_music/
+certs/
