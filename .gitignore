@@ -34,5 +34,10 @@ htmlcov/
 ._*
 __MACOSX/
 
+# Demos y Certificados (HTTPS)
 .demo_music/
 certs/
+
+# Bibliotecas locales de cada servidor
+music/S1/
+music/S2/
