@@ -13,7 +13,7 @@ services:
       - key: SOUNDFLOW_CORS_ORIGINS
         value: https://sangrador21.github.io
       - key: SOUNDFLOW_PEERS
-        value: ""
+        value: https://soundflow-s2.onrender.com
       - key: SOUNDFLOW_WAIT_TIMEOUT
         value: "120"
       - key: SOUNDFLOW_PEER_TIMEOUT
@@ -34,7 +34,7 @@ services:
       - key: SOUNDFLOW_CORS_ORIGINS
         value: https://sangrador21.github.io
       - key: SOUNDFLOW_PEERS
-        value: ""
+        value: https://soundflow-s1.onrender.com
       - key: SOUNDFLOW_WAIT_TIMEOUT
         value: "120"
       - key: SOUNDFLOW_PEER_TIMEOUT
