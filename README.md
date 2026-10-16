@@ -2,8 +2,6 @@
 
 SoundFlow es una aplicación web de música con múltiples clientes y servidores. El frontend utiliza **React, TypeScript, Vite y Tailwind CSS**; el backend conserva la API REST de Python y Flask, los catálogos distribuidos, la asignación por recursos y la espera FIFO.
 
-La interfaz mantiene la paleta morada y las tipografías DM Sans y Plus Jakarta Sans. La versión de escritorio anterior se conserva en la etiqueta `p06-final`; esta adaptación se desarrolla en `feature/web-p06`.
-
 ## Funciones
 
 - Reproducción directa desde la biblioteca, búsqueda y filtro por servidor.
