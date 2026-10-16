@@ -2,6 +2,16 @@
 
 SoundFlow es una aplicación web de música con múltiples clientes y servidores. El frontend utiliza **React, TypeScript, Vite y Tailwind CSS**; el backend conserva la API REST de Python y Flask, los catálogos distribuidos, la asignación por recursos y la espera FIFO.
 
+## Aplicación desplegada
+
+[Acceder a SoundFlow](https://sangrador21.github.io/SoundFlow/)
+
+### Servidores de la API
+
+- [Servidor S1](https://soundflow-s1.onrender.com/api/health)
+- [Servidor S2](https://soundflow-s2.onrender.com/api/health)
+
+
 ## Funciones
 
 - Reproducción directa desde la biblioteca, búsqueda y filtro por servidor.
