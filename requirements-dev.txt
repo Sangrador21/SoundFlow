@@ -1,2 +1,2 @@
--r requirements.txt
-pytest>=8,<10
+-c backend/constraints.txt
+-r backend/requirements-dev.txt

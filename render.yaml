@@ -1,0 +1,43 @@
+services:
+  - type: web
+    name: soundflow-s1
+    runtime: docker
+    plan: free
+    branch: feature/web-p06
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: SOUNDFLOW_NODE_ID
+        value: S1
+      - key: SOUNDFLOW_CORS_ORIGINS
+        value: https://sangrador21.github.io
+      - key: SOUNDFLOW_PEERS
+        value: https://soundflow-s2.onrender.com
+      - key: SOUNDFLOW_WAIT_TIMEOUT
+        value: "120"
+      - key: SOUNDFLOW_PEER_TIMEOUT
+        value: "2"
+      - key: SOUNDFLOW_CLUSTER_TOKEN
+        sync: false
+  - type: web
+    name: soundflow-s2
+    runtime: docker
+    plan: free
+    branch: feature/web-p06
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: SOUNDFLOW_NODE_ID
+        value: S2
+      - key: SOUNDFLOW_CORS_ORIGINS
+        value: https://sangrador21.github.io
+      - key: SOUNDFLOW_PEERS
+        value: https://soundflow-s1.onrender.com
+      - key: SOUNDFLOW_WAIT_TIMEOUT
+        value: "120"
+      - key: SOUNDFLOW_PEER_TIMEOUT
+        value: "2"
+      - key: SOUNDFLOW_CLUSTER_TOKEN
+        sync: false

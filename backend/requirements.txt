@@ -1,0 +1,9 @@
+Flask>=3.1,<4
+flask-cors>=6,<7
+requests>=2.32,<3
+mutagen>=1.47,<2
+psutil>=6,<8
+imageio-ffmpeg>=0.6,<0.7
+cryptography>=44,<51
+python-dotenv>=1.1,<2
+gunicorn>=23,<24; sys_platform != 'win32'
