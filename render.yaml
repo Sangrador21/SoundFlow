@@ -3,7 +3,7 @@ services:
     name: soundflow-s1
     runtime: docker
     plan: free
-    branch: feature/web-p06
+    branch: main
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /api/health
@@ -24,7 +24,7 @@ services:
     name: soundflow-s2
     runtime: docker
     plan: free
-    branch: feature/web-p06
+    branch: main
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /api/health
