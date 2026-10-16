@@ -1,0 +1,17 @@
+.git
+.venv
+**/__pycache__
+**/.pytest_cache
+**/node_modules
+frontend
+.local_music
+.demo_music
+music/S1
+music/S2
+certs
+**/.env
+**/.env.*
+!**/.env.example
+**/tests
+docs
+*.zip

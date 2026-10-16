@@ -1,0 +1,38 @@
+@font-face {
+  font-family: "DM Sans";
+  font-style: normal;
+  font-weight: 100 1000;
+  font-display: swap;
+  src: url("@fontsource-variable/dm-sans/files/dm-sans-latin-wght-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "Plus Jakarta Sans";
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url("@fontsource-variable/plus-jakarta-sans/files/plus-jakarta-sans-latin-wght-normal.woff2")
+    format("woff2");
+}
+@theme {
+  --color-primary: #4b2fa3;
+  --color-primary-dark: #1e0a4e;
+  --color-purple: #7a4fd6;
+  --color-lavender: #eee8fb;
+  --font-body: "DM Sans", sans-serif;
+  --font-heading: "Plus Jakarta Sans", sans-serif;
+}
+:root {
+  --primary: #4b2fa3;
+  --primary-dark: #1e0a4e;
+  --purple: #7a4fd6;
+  --text: #242235;
+  --muted: #7a748a;
+  --border: #e9e5f0;
+  --surface: #fff;
+  --soft: #faf9fd;
+  --canvas: #f4f3f8;
+  --green: #25845a;
+  --radius: 16px;
+  --sidebar: 220px;
+}

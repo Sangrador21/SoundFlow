@@ -1,268 +1,223 @@
-# SoundFlow — Práctica 06: servicios web
+# SoundFlow — P06: streaming mediante servicios web
 
-SoundFlow es una aplicación de streaming de música con múltiples clientes y servidores. Esta práctica adapta la base de la práctica 04 a una API REST mediante HTTP y HTTPS, conservando una interfaz de escritorio desarrollada con Python y Tkinter.
+SoundFlow es una aplicación web de música con múltiples clientes y servidores. El frontend utiliza **React, TypeScript, Vite y Tailwind CSS**; el backend conserva la API REST de Python y Flask, los catálogos distribuidos, la asignación por recursos y la espera FIFO.
 
-Cada servidor puede almacenar un catálogo diferente. El cliente consulta el catálogo del conjunto de servidores y solicita el audio al nodo que tiene la canción y dispone de recursos para atenderla.
+La interfaz mantiene la paleta morada y las tipografías DM Sans y Plus Jakarta Sans. La versión de escritorio anterior se conserva en la etiqueta `p06-final`; esta adaptación se desarrolla en `feature/web-p06`.
 
-## Funcionalidades
+## Funciones
 
-- Catálogo distribuido con búsqueda por canción o artista.
-- Identificación de canciones por SHA-256 del contenido para evitar duplicados entre servidores.
-- Reproducción directa al seleccionar una canción.
-- Cola de reproducción opcional, separada de la canción actual.
-- Pausa, continuación, anterior, siguiente, detención y volumen.
-- Avance y retroceso a un segundo específico de la canción.
-- Recepción progresiva del audio y recuperación ante interrupciones de transferencia.
-- Servidor de entrada alternativo mediante `--fallback`.
-- Espera FIFO cuando no es posible asignar una solicitud de inmediato.
-- HTTPS con validación del certificado y del nombre del servidor.
-- Interfaz con paleta morada, controles con iconos y detalles de conexión opcionales.
+- Reproducción directa desde la biblioteca, búsqueda y filtro por servidor.
+- Selección múltiple y cola opcional; vaciarla no detiene la canción actual.
+- Pausa, continuación, anterior, siguiente, detención, volumen y avance por segundos.
+- Audio progresivo en un AudioWorklet independiente del renderizado de React.
+- Recuperación de una transferencia desde la última muestra completa recibida, sin duplicar audio.
+- Servidores con bibliotecas distintas y canciones compartidas deduplicadas por SHA-256.
+- Asignación al nodo disponible de menor carga, con reservas sincronizadas.
+- Sin un máximo fijo de clientes impuesto por la aplicación. La admisión depende de CPU y memoria.
+- Espera FIFO por coordinador, cancelación y vencimiento de solicitudes.
+- Vista de los servidores con métricas reales y configuración de las URL desde el navegador.
+- HTTPS público mediante los certificados administrados por Render.
 
-## Tecnologías
+## Organización
 
-| Componente | Tecnología |
+| Ruta | Responsabilidad |
 |---|---|
-| Interfaz de escritorio | Tkinter y ttk |
-| API REST | Flask |
-| Cliente HTTP y comunicación entre servidores | Requests |
-| Reproducción | pygame.mixer en un proceso independiente |
-| Decodificación y búsqueda temporal | FFmpeg |
-| Metadatos musicales | Mutagen |
-| Monitoreo de CPU y memoria | psutil |
-| Certificados de prueba | cryptography |
-| Pruebas automatizadas | pytest |
+| `backend/server.py` | Servidor local por línea de comandos |
+| `backend/wsgi.py` | Entrada WSGI para Gunicorn |
+| `backend/soundflow/server_core.py` | Catálogos, descubrimiento, asignación, FIFO y transmisión |
+| `backend/soundflow/config.py` | Variables de entorno y validación de configuración |
+| `backend/soundflow/resources.py` | Métricas del host o cuotas de cgroup v2 |
+| `backend/tests/` | Pruebas de API, concurrencia, certificados y configuración web |
+| `frontend/src/app/` | Aplicación y proveedor del estado compartido |
+| `frontend/src/components/` | Distribución general y componentes reutilizables |
+| `frontend/src/features/catalog/` | Biblioteca, filtros y selección |
+| `frontend/src/features/player/` | Controlador, motor de audio, reproductor y cola |
+| `frontend/src/features/cluster/` | Estado y configuración de los servidores |
+| `frontend/src/services/` | Cliente HTTP, asignación y consulta de tickets |
+| `frontend/src/styles/` | Tema, estilos base y estilos por función |
+| `frontend/public/worklets/` | Procesador PCM del hilo de audio |
+| `deploy/catalogs/` | Manifiestos con las canciones de S1 y S2 |
+| `tools/` | Preparación de bibliotecas y comprobaciones |
+| `.github/workflows/` | Pruebas y publicación en GitHub Pages |
 
-Las peticiones de red se ejecutan en hilos. La interfaz y el proceso de audio intercambian comandos y eventos mediante colas de `multiprocessing`. Los servidores sincronizan las reservas, sesiones y solicitudes pendientes para atender peticiones concurrentes.
+## Requisitos
 
-## Requisitos e instalación
+- Python 3.12 recomendado para coincidir con el contenedor de despliegue.
+- Node.js 24 y npm. Las dependencias exactas del frontend están en `package-lock.json`.
+- Un navegador actualizado con AudioWorklet y Web Audio: Safari, Chrome, Edge o Firefox.
+- FFmpeg; localmente se utiliza el del sistema o el de `imageio-ffmpeg`. La imagen Docker instala FFmpeg.
 
-Se requiere Python 3.10 o superior, Tkinter y una salida de audio. Las dependencias deben estar instaladas en un entorno virtual del proyecto.
+El backend ya no necesita Tkinter, pygame ni una salida de audio en el servidor.
+
+## Instalación local
+
+Desde la raíz del repositorio:
 
 ```bash
-git clone https://github.com/Sangrador21/SoundFlow.git
-cd SoundFlow
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
 python tools/check_environment.py
+python tools/build_catalog.py
 ```
 
-En Windows, crea y activa el entorno con:
+Si el entorno ya existe, solo actívalo. En Windows se activa con `.venv\Scripts\activate`; los ejemplos de continuación de línea `\` deben escribirse en una sola línea en CMD.
 
-```bat
-py -m venv .venv
-.venv\Scripts\activate
-python -m pip install -r requirements.txt
-python tools/check_environment.py
-```
+Los manifiestos utilizan las 18 canciones MP3 originales presentes en `music/`. El tono `demo_tono.wav` se conserva como recurso de prueba y queda fuera de los catálogos de música.
 
-FFmpeg se obtiene del sistema si está disponible. En caso contrario, la aplicación utiliza el ejecutable de `imageio-ffmpeg` cuando existe una distribución binaria compatible con la plataforma.
+| Nodo | Biblioteca | Distribución |
+|---|---|---|
+| S1 | 12 canciones | 6 exclusivas y 6 compartidas |
+| S2 | 12 canciones | 6 exclusivas y las mismas 6 compartidas |
+| Catálogo agregado | 18 canciones únicas | Las compartidas aparecen una sola vez |
 
-### Entorno de macOS
+Compartidas: Beautiful Things, Can I Call You Tonight, Cleopatra, Daylight, On Melancholy Hill y Sweater Weather.
 
-Tkinter debe estar disponible en la instalación de Python; no se instala mediante pip. Para Python 3.14 instalado con Homebrew, el componente correspondiente es:
+Exclusivas de S1: California Sand, Cerraron Chipinque, De Música Ligera, Don't Kill the Magic, End Of Beginning y Eres tú.
+
+Exclusivas de S2: I Wanna Be Yours, Stubborn Love, Summertime Sadness, Te Veo a la Vuelta, Todo Lo Fue y Yo Todo Lo Doy.
+
+`tools/build_catalog.py` copia exclusivamente los archivos de cada manifiesto a `.local_music/S1` y `.local_music/S2`. No altera los originales. Sincroniza únicamente los archivos que generó y rechaza una salida que contenga archivos ajenos. Estas copias no se suben a Git; Docker prepara la misma selección al construir cada servidor.
+
+### Agregar canciones
+
+1. Guarda el audio original en `music/` (MP3, WAV, OGG o FLAC).
+2. Agrega su nombre exacto al JSON de S1, S2 o ambos dentro de `deploy/catalogs/`.
+3. Ejecuta `python tools/build_catalog.py` y reinicia los nodos locales.
+4. Actualiza la biblioteca en el navegador. No se necesita cambiar el frontend ni fijar un nuevo número de canciones en las pruebas.
+5. Para publicar, sube el audio y los manifiestos; reconstruye los servicios de Render que cambien.
+
+La prueba de integración calcula los identificadores SHA-256, los servidores de cada canción y el conteo de cada nodo leyendo los manifiestos y los audios originales. También se comprueba que todo audio original esté asignado (excepto el tono de prueba). Conserva al menos una canción compartida y una exclusiva por nodo para demostrar la distribución y el acceso a canciones remotas.
+
+### Iniciar los servidores
+
+En dos terminales con el entorno activo, desde la raíz:
+
+**S1**
 
 ```bash
-brew install python-tk@3.14
+python backend/server.py --port 5000 --server-id S1 \
+  --music .local_music/S1 --peer http://127.0.0.1:5001
 ```
 
-Si pygame está instalado pero falta `pygame.mixer`, instala las dependencias de audio y recompila pygame dentro del entorno virtual:
+**S2**
 
 ```bash
-brew install sdl2_mixer pkgconf
-python -m pip install --no-cache-dir --force-reinstall --no-binary=pygame pygame==2.6.1
+python backend/server.py --port 5001 --server-id S2 \
+  --music .local_music/S2 --peer http://127.0.0.1:5000
 ```
 
-Comprueba el audio con:
+### Iniciar el frontend
+
+En otra terminal:
 
 ```bash
-python -c "import pygame.mixer; pygame.mixer.init(); print('Audio OK:', pygame.mixer.get_init()); pygame.mixer.quit()"
+cd frontend
+npm ci
+npm run dev
 ```
 
-## Bibliotecas de música
+Abre **http://localhost:5173**. En desarrollo se utilizan los servidores locales anteriores; puedes cambiarlos desde **Configurar servidores**. No es necesario crear archivos `.env` para esta prueba.
 
-Desde la raíz del proyecto, crea una carpeta para cada servidor:
+`localhost` es un contexto admitido para Web Audio. Al publicar, la página y las API deben utilizar HTTPS. Abrir la página desde una IP LAN con HTTP puede impedir AudioWorklet.
 
-```bash
-mkdir -p music/S1 music/S2
-```
+## Uso
 
-Coloca archivos diferentes en cada una. Puedes copiar una misma canción a ambas para comprobar que aparece una sola vez en el catálogo agregado.
+Pulsa una canción o su botón de reproducción para escucharla directamente. Para preparar varias, marca sus casillas y usa **Agregar a cola**. El panel se abre al agregar canciones, se oculta cuando queda vacío y puede alternarse con **Cola**.
 
-Se admiten archivos MP3, WAV, OGG y FLAC. Cada servidor lee los archivos directamente dentro de la carpeta indicada por `--music`; no recorre subcarpetas.
+El reproductor inferior permite pausar, continuar, detener, cambiar de pista y ajustar el volumen. La barra de tiempo solicita audio desde la posición elegida; el avance realizado mientras está pausado conserva la pausa. La recepción de audio se mantiene progresiva, con un búfer de aproximadamente 20 segundos para evitar descargar toda la canción en memoria.
 
-Las carpetas locales `music/S1/` y `music/S2/` están ignoradas por Git. Al clonar el proyecto en otra computadora deben crearse y poblarse nuevamente.
+**Servidores** muestra la información de la última consulta al clúster. **Actualizar biblioteca** vuelve a consultar los nodos. Configurar nuevas direcciones detiene la reproducción y las guarda únicamente en ese navegador.
 
-### Música de prueba opcional
+El audio comienza tras un gesto del usuario. Si el navegador suspende el contexto de audio, utiliza reproducir para continuar.
 
-Para probar sin preparar archivos musicales, ejecuta:
+## Comunicación y coordinación
 
-```bash
-python tools/prepare_demo.py
-```
+1. El navegador consulta `/api/catalog` y puede usar otra URL si una entrada falla.
+2. Para reproducir, envía `song_id` y `start` a `/api/requests`.
+3. El coordinador descubre los nodos conocidos, localiza los que tienen la canción y selecciona uno según sesiones, CPU y memoria.
+4. El nodo elegido reserva la sesión. Si no puede asignarse todavía, el ticket permanece en FIFO y el cliente consulta su estado.
+5. El navegador recibe PCM del nodo asignado; un AudioWorklet lo reproduce en un hilo de audio separado.
+6. Si la transferencia se interrumpe, solicita otra asignación desde las muestras completas ya recibidas. Los bytes de una muestra incompleta se descartan y se vuelven a pedir.
 
-Se generan dos bibliotecas en `.demo_music/S1` y `.demo_music/S2`, con tonos WAV de 12 segundos: una pista exclusiva de cada servidor y otra compartida. Para utilizarlas, sustituye las rutas `music/S1` y `music/S2` de los comandos de arranque por `.demo_music/S1` y `.demo_music/S2`.
+La cola de canciones del usuario es distinta de la FIFO de solicitudes del servicio. La FIFO existe por coordinador y conserva el orden de llegada; una solicitud pendiente puede retrasar las siguientes.
 
-## Ejecución mediante HTTP
-
-Ejecuta cada componente en una terminal distinta, desde la raíz del proyecto y con el entorno virtual activo.
-
-**Servidor S1:**
-
-```bash
-python server.py --port 5000 --server-id S1 \
-  --music music/S1 --peer http://127.0.0.1:5001
-```
-
-**Servidor S2:**
-
-```bash
-python server.py --port 5001 --server-id S2 \
-  --music music/S2 --peer http://127.0.0.1:5000
-```
-
-**Cliente:**
-
-```bash
-python main.py --server http://127.0.0.1:5000 \
-  --fallback http://127.0.0.1:5001
-```
-
-Para probar varios clientes, ejecuta el comando del cliente en terminales adicionales. Cada instancia utiliza su propio proceso de audio y caché temporal.
-
-Los ejemplos con `\` utilizan continuación de línea de Bash/zsh. En CMD de Windows, escribe cada comando completo en una sola línea.
-
-## Ejecución mediante HTTPS
-
-Detén los servidores HTTP antes de reutilizar sus puertos. Genera una vez la CA local y el certificado de los servidores:
-
-```bash
-python tools/create_cert.py
-```
-
-Se crean `certs/ca.pem`, `certs/server.pem` y `certs/server-key.pem`, válidos para pruebas con `localhost` y `127.0.0.1`. El generador no sobrescribe certificados existentes. Si ya están generados y son válidos, reutilízalos.
-
-**Servidor S1:**
-
-```bash
-python server.py --port 5000 --server-id S1 \
-  --music music/S1 --peer https://127.0.0.1:5001 \
-  --cert certs/server.pem --key certs/server-key.pem --ca certs/ca.pem
-```
-
-**Servidor S2:**
-
-```bash
-python server.py --port 5001 --server-id S2 \
-  --music music/S2 --peer https://127.0.0.1:5000 \
-  --cert certs/server.pem --key certs/server-key.pem --ca certs/ca.pem
-```
-
-**Cliente:**
-
-```bash
-python main.py --server https://127.0.0.1:5000 \
-  --fallback https://127.0.0.1:5001 --ca certs/ca.pem
-```
-
-El cliente y los servidores verifican los certificados usando `--ca`. Los certificados incorporan identificadores de clave y extensiones compatibles con la validación X.509 estricta.
-
-Para probar en una red local con otras computadoras, incluye sus IP o nombres al generar el certificado mediante `--host`. En cada servidor, utiliza `--host 0.0.0.0`, anuncia su dirección accesible con `--base-url https://IP:PUERTO` y configura los pares con sus direcciones reales. Los clientes necesitan la CA pública `ca.pem`; la clave privada debe permanecer en los servidores de prueba. Las direcciones anunciadas deben coincidir con los nombres o IP incluidos en el certificado.
-
-## Uso del cliente
-
-Selecciona una canción en la biblioteca para reproducirla. Para preparar varias pistas, selecciónalas con Ctrl/⌘ y utiliza **Agregar a cola**. El panel **A continuación** se abre al agregar canciones y se oculta cuando queda vacío; también puede abrirse o cerrarse mediante **Cola**.
-
-Los controles con iconos permiten cambiar de pista, reproducir o pausar y detener. Su descripción aparece al pasar el cursor; pueden activarse con el teclado. Arrastra la barra de tiempo para adelantar o retroceder: el cliente cancela la transferencia anterior y solicita audio desde la posición elegida.
-
-Vaciar la cola no detiene la canción actual. Al terminar una pista se reproduce la siguiente de la cola; si no quedan canciones, la reproducción finaliza. **Detalles de conexión** muestra el servidor de entrada y el nodo que entrega el audio.
-
-## Asignación de solicitudes y espera
-
-El servidor que recibe una petición descubre los nodos conocidos y localiza los que tienen la canción. La asignación considera las sesiones activas, la CPU y la memoria; el nodo elegido reserva la sesión de forma sincronizada.
-
-No existe un límite fijo de transferencias por número de clientes. La admisión depende de los recursos: por defecto, un nodo deja de aceptar nuevas transferencias si su CPU o memoria alcanza el 95 %. Los umbrales pueden ajustarse mediante `--cpu-threshold` y `--memory-threshold`.
-
-Cuando no hay un nodo disponible que pueda proporcionar la canción, la solicitud puede permanecer en espera FIFO. El cliente consulta su estado y continúa cuando se asigna un servidor. La espera del coordinador vence después de 60 segundos por defecto; se configura con `--wait-timeout`. Si todos los nodos conocidos responden y ninguno tiene la canción, se informa que no existe.
-
-La FIFO pertenece a cada coordinador; no es una cola global compartida por todo el clúster. Esta espera del servicio es independiente de la cola de canciones del usuario.
-
-### Prueba de espera y recuperación
-
-1. Inicia S1 normalmente y S2 agregando `--maintenance` al comando de arranque.
-2. Desde el cliente conectado a S1, solicita una canción que solo esté en S2.
-3. Observa el estado de espera y su posición FIFO.
-4. Detén S2 y reinícialo sin `--maintenance`, antes de que venza la espera.
-5. Comprueba que la solicitud se asigna y comienza la reproducción.
-
-`--maintenance` mantiene disponible el catálogo del nodo, pero desactiva temporalmente la admisión de audio local.
+Los umbrales de admisión son 95 % de CPU y memoria por defecto. La espera del servicio vence a los 120 segundos y se configura con `SOUNDFLOW_WAIT_TIMEOUT`. La recuperación del cliente también tiene un presupuesto finito. Una canción que no existe en los nodos conocidos genera un error, no una espera ilimitada.
 
 ## API REST
 
 | Método | Ruta | Función |
 |---|---|---|
-| GET | `/api/health` | Estado, carga y sesiones del nodo |
+| GET | `/api/health` | Estado del nodo, carga y sesiones |
 | GET | `/api/node` | Catálogo local y pares conocidos |
-| GET | `/api/catalog` | Catálogo agregado de los servidores |
-| POST | `/api/requests` | Solicitar una canción y una posición inicial |
-| GET | `/api/requests/<id>` | Consultar la asignación o espera |
-| DELETE | `/api/requests/<id>` | Cancelar una solicitud y su sesión |
-| POST | `/api/internal/streams` | Reservar audio local entre servidores |
-| GET | `/api/streams/<id>/audio` | Recibir el audio de la sesión |
-| GET | `/api/streams/<id>` | Consultar el estado de una transferencia |
-| DELETE | `/api/streams/<id>` | Cancelar una transferencia |
+| GET | `/api/catalog` | Catálogo agregado y nodos disponibles o sin conexión |
+| POST | `/api/requests` | Solicitar una canción desde un segundo |
+| GET | `/api/requests/<id>` | Consultar asignación o posición FIFO |
+| DELETE | `/api/requests/<id>` | Cancelar solicitud y sesión |
+| POST | `/api/internal/streams` | Reserva interna entre servidores |
+| GET | `/api/streams/<id>/audio` | Audio PCM progresivo |
+| GET | `/api/streams/<id>` | Estado de la transferencia |
+| DELETE | `/api/streams/<id>` | Cancelar transferencia |
 
-Ejemplo del cuerpo JSON para solicitar audio:
+El audio utiliza PCM S16LE, dos canales y 44.1 kHz. El servidor normaliza el audio y recorta por índice de muestra, para que una reanudación de MP3 coincida con la decodificación continua. Recorrer el audio previo a la posición elegida puede aumentar el tiempo de búsqueda en archivos largos. Los encabezados `X-Audio-Format`, `X-Sample-Rate`, `X-Channels`, `X-Audio-Start` y `X-Audio-Duration` describen la transferencia y están expuestos mediante CORS.
 
-```json
-{
-  "song_id": "IDENTIFICADOR_OBTENIDO_DEL_CATALOGO",
-  "start": 30.0
-}
-```
+## Configuración del backend
 
-Una solicitud asignada responde con `201`; una pendiente, con `202`. El audio se transmite como PCM S16LE, estéreo, a 44.1 kHz. FFmpeg decodifica el archivo original y aplica la posición de inicio solicitada. El cliente comienza a reproducir al disponer de aproximadamente un segundo de audio y continúa recibiendo datos en segundo plano.
+Consulta `backend/.env.example`. Los valores pueden establecerse como variables del proceso o en `backend/.env` para uso local.
 
-## Estructura del proyecto
-
-| Archivo o carpeta | Contenido |
+| Variable | Uso |
 |---|---|
-| `main.py` | Punto de entrada del cliente |
-| `server.py` | Punto de entrada del servidor REST |
-| `soundflow/` | Interfaz, componentes visuales, cliente HTTP, audio y lógica del servidor |
-| `music/` | Archivos musicales y bibliotecas locales |
-| `tools/` | Comprobación del entorno, certificados y tonos de prueba |
-| `tests/` | Pruebas automatizadas |
-| `requirements.txt` | Dependencias de ejecución |
-| `requirements-dev.txt` | Dependencias para ejecutar pruebas |
-| `pytest.ini` | Configuración de pytest |
-| `.gitignore` | Exclusiones de archivos locales y temporales |
+| `SOUNDFLOW_NODE_ID` | Identificador del nodo: S1 o S2 |
+| `SOUNDFLOW_BASE_URL` | URL pública anunciada; en Render se usa automáticamente `RENDER_EXTERNAL_URL` si no se establece |
+| `SOUNDFLOW_MUSIC_DIR` | Biblioteca local; en Docker se configura como `/app/music` |
+| `SOUNDFLOW_PEERS` | URL base de los pares, separadas por comas |
+| `SOUNDFLOW_CORS_ORIGINS` | Orígenes permitidos del frontend, sin rutas |
+| `SOUNDFLOW_CLUSTER_TOKEN` | Token compartido solo entre servidores |
+| `SOUNDFLOW_WAIT_TIMEOUT` | Vencimiento de espera, en segundos |
+| `SOUNDFLOW_PEER_TIMEOUT` | Tiempo de espera para consultar pares |
+| `SOUNDFLOW_CPU_THRESHOLD` | Umbral de CPU para admitir transferencias |
+| `SOUNDFLOW_MEMORY_THRESHOLD` | Umbral de memoria para admitir transferencias |
+| `SOUNDFLOW_MAINTENANCE` | `true` para consultar el catálogo sin admitir audio local |
+| `PORT` | Puerto del servidor WSGI proporcionado por Render |
+
+CORS permite orígenes explícitos. Para GitHub Pages, el origen es `https://sangrador21.github.io`, sin `/SoundFlow/`. El token del clúster nunca se coloca en variables `VITE_*`, en GitHub Pages ni en el código del navegador.
+
+## Despliegue
+
+La guía completa está en **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**:
+
+- Dos servicios Docker en Render, uno por nodo.
+- Cada imagen final contiene solo las canciones de su manifiesto.
+- Gunicorn con un único worker y varios hilos, porque las sesiones y la FIFO están en memoria.
+- Frontend estático en GitHub Pages, compilado mediante GitHub Actions con base `/SoundFlow/`.
+- URL públicas de las API configuradas mediante la variable de repositorio `SOUNDFLOW_API_URLS`.
+- Certificados HTTPS administrados por las plataformas; no se suben los certificados locales.
 
 ## Pruebas
 
-Con el entorno virtual activo:
-
 ```bash
-python -m pip install -r requirements-dev.txt
 python -m pytest -q
+cd frontend
+npm test
+npm run build
 ```
 
-Las pruebas cubren catálogos distribuidos, deduplicación, coordinación entre servidores, concurrencia, espera FIFO, cancelación, recuperación de transferencias, búsqueda temporal, reproducción progresiva y certificados HTTPS con validación estricta. También verifican las acciones principales del controlador de la interfaz y la detección de dependencias de audio faltantes.
+Para verificar el cliente TypeScript contra dos procesos Gunicorn reales, vuelve a la raíz y ejecuta en macOS o Linux:
 
-Las pruebas del reproductor utilizan una salida de audio de prueba de SDL. La revisión visual de Tkinter y la salida física de audio se comprueban ejecutando la aplicación en el equipo del usuario.
+```bash
+python tools/check_web_integration.py
+```
 
-## Archivos locales y control de versiones
+Esta prueba prepara las bibliotecas, inicia ambos nodos en puertos locales temporales, compara el catálogo real completo con los manifiestos, comprueba la deduplicación y recibe una canción de S2 entrando por S1 con una URL de respaldo. Después cierra los procesos. El test de integración se omite en `npm test` normal porque necesita esos procesos.
 
-El entorno virtual, la caché de reproducción, los certificados locales, los tonos generados y las carpetas `music/S1/` y `music/S2/` están excluidos mediante `.gitignore`. Estos archivos se crean o configuran en cada instalación.
+Las pruebas unitarias cubren la concurrencia, FIFO, cancelación, avance, CORS, certificados, límites de recursos, controles de la interfaz y recuperación PCM sin duplicados. El procesador del AudioWorklet se prueba con muestras de audio y el DOM se prueba con jsdom. La salida física de audio y el comportamiento visual deben verificarse también en un navegador real.
 
-`main` contiene la versión estable y `develop/p06` se utiliza para el desarrollo de esta práctica. La etiqueta `p04-base` conserva la base original y `p06-final` identifica la versión de cierre de la práctica 06.
+GitHub Actions ejecuta las pruebas y la compilación; además construye las imágenes Docker de ambos nodos.
 
 ## Alcance
 
-El cliente actual es una aplicación de escritorio que consume servicios web. Publicar una interfaz en GitHub Pages requeriría un cliente web adicional.
+La práctica conserva el estado de solicitudes y sesiones en memoria. Reiniciar un nodo pierde ese estado; el cliente puede buscar una nueva asignación. No se configura Gunicorn con múltiples workers ni se utiliza `--preload`.
 
-Los servidores incluidos se ejecutan con Flask para pruebas locales. La cola y las sesiones se mantienen en memoria; un reinicio pierde ese estado. Un despliegue posterior debe utilizar un servidor de producción y conservar un solo proceso con hilos por nodo mientras ese estado siga en memoria.
+El PCM utiliza aproximadamente 176.4 kB/s por transferencia y requiere decodificación con FFmpeg. Los recursos físicos y los hilos disponibles del servidor siguen siendo finitos, aunque la aplicación no imponga un contador máximo de clientes.
 
-La transmisión PCM utiliza aproximadamente 176.4 kB/s por canción, además del búfer en disco y la decodificación con FFmpeg. No tener un límite fijo de clientes no elimina los límites físicos de CPU, memoria, disco y red.
-
-La práctica no implementa autenticación de usuarios ni almacenamiento distribuido persistente. Puede protegerse la reserva interna de sesiones configurando el mismo `SOUNDFLOW_CLUSTER_TOKEN` en todos los servidores. El despliegue en nube queda como una etapa posterior.
+Los servicios gratuitos de Render pueden entrar en reposo y perder cambios realizados en su disco local. Las canciones se incorporan a la imagen durante la construcción; no dependen de archivos subidos durante la ejecución. Esta versión no incorpora cuentas de usuario ni autenticación del oyente.

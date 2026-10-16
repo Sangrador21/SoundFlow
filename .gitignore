@@ -41,3 +41,10 @@ certs/
 # Bibliotecas locales de cada servidor
 music/S1/
 music/S2/
+
+# Web / Node
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+coverage/
+.local_music/
