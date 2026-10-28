@@ -1,7 +1,7 @@
 name: Publish web to GitHub Pages
 on:
   push:
-    branches: [main, feature/web-p06]
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read

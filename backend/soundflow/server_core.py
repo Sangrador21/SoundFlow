@@ -29,6 +29,7 @@ from .audio import SAMPLE_RATE, CHANNELS, BYTES_PER_SECOND, CHUNK_BYTES, ffmpeg_
 from .http_utils import normalize_url
 from .library import MusicLibrary
 from .resources import ResourceMonitor
+from .downloads import download_response
 
 log = logging.getLogger('soundflow.server')
 
@@ -93,7 +94,8 @@ class SoundFlowServer:
             'methods': ['GET', 'POST', 'DELETE', 'OPTIONS'],
             'allow_headers': ['Content-Type'],
             'expose_headers': ['X-Audio-Format', 'X-Sample-Rate', 'X-Channels',
-                               'X-Audio-Start', 'X-Audio-Duration', 'X-Server-ID', 'X-Estimated-Bytes'],
+                               'X-Audio-Start', 'X-Audio-Duration', 'X-Server-ID', 'X-Estimated-Bytes',
+                               'X-Download-SHA256', 'X-Download-Bytes'],
         }}, supports_credentials=False, max_age=600)
         self._routes()
         self.worker = threading.Thread(target=self._maintenance_loop, daemon=True,
@@ -491,6 +493,10 @@ class SoundFlowServer:
         @app.get('/api/streams/<stream_id>/audio')
         def audio(stream_id):
             return self._audio_response(stream_id)
+
+        @app.get('/api/streams/<stream_id>/download')
+        def download(stream_id):
+            return download_response(self, stream_id)
 
         @app.get('/api/streams/<stream_id>')
         def stream_status(stream_id):

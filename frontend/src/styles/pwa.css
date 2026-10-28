@@ -1,0 +1,71 @@
+.pwa-panel {
+  margin-bottom: 20px;
+}
+.pwa-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.pwa-summary .button {
+  min-height: 34px;
+  font-size: 11px;
+}
+.pwa-ready {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.pwa-notice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: var(--lavender);
+  color: var(--primary);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.pwa-notice p {
+  flex: 1;
+}
+.install-help {
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--muted);
+}
+.install-help ul {
+  padding-left: 20px;
+  margin: 16px 0;
+}
+.install-help li {
+  margin-bottom: 12px;
+}
+.catalog-saved {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  margin-bottom: 14px;
+}
+@media (max-width: 600px) {
+  .pwa-notice {
+    flex-wrap: wrap;
+  }
+  .pwa-notice .button {
+    margin-left: 30px;
+  }
+}
+@media (display-mode: standalone) {
+  .app-header {
+    padding-top: max(14px, env(safe-area-inset-top));
+    padding-left: max(16px, env(safe-area-inset-left));
+    padding-right: max(16px, env(safe-area-inset-right));
+  }
+  .player-bar {
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+  }
+}

@@ -64,9 +64,9 @@ export function Sidebar({
         </div>
       </div>
       <div className="sidebar-footer">
-        <span>P06</span>
+        <span>P07</span>
         <div>
-          Servicios web<small>Sistemas Distribuidos</small>
+          Aplicación PWA<small>Sistemas Distribuidos</small>
         </div>
       </div>
     </aside>

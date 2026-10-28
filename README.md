@@ -1,6 +1,8 @@
-# SoundFlow — P06: streaming mediante servicios web
+# SoundFlow — P07: aplicación web progresiva
 
-SoundFlow es una aplicación web de música con múltiples clientes y servidores. El frontend utiliza **React, TypeScript, Vite y Tailwind CSS**; el backend conserva la API REST de Python y Flask, los catálogos distribuidos, la asignación por recursos y la espera FIFO.
+SoundFlow es una aplicación web progresiva (PWA) de música con múltiples clientes y servidores, basada en la práctica 06. El frontend utiliza **React, TypeScript, Vite y Tailwind CSS**; el backend conserva la API REST de Python y Flask, los catálogos distribuidos, la asignación por recursos y la espera FIFO.
+
+La PWA incorpora manifiesto, iconos instalables, service worker y apertura de la interfaz sin conexión. La última biblioteca se guarda como referencia y se conservan hasta tres canciones recientes completas en IndexedDB para escucharlas sin conexión. **[Guía y pruebas de la PWA](docs/PWA.md)**.
 
 ## Aplicación desplegada
 
@@ -14,6 +16,11 @@ SoundFlow es una aplicación web de música con múltiples clientes y servidores
 
 ## Funciones
 
+- Instalación desde navegadores compatibles y apertura en una ventana independiente.
+- Caché versionada de la interfaz, fuentes y AudioWorklet, aislada bajo la ruta de la aplicación.
+- Actualizaciones con consentimiento: no recargan automáticamente durante una reproducción.
+- Hasta tres canciones recientes completas en IndexedDB, con reproducción local, pausa, avance y eliminación de copias.
+- Biblioteca de referencia sin conexión; sesiones y métricas siguen fuera del almacenamiento local.
 - Reproducción directa desde la biblioteca, búsqueda y filtro por servidor.
 - Selección múltiple y cola opcional; vaciarla no detiene la canción actual.
 - Pausa, continuación, anterior, siguiente, detención, volumen y avance por segundos.
@@ -41,6 +48,7 @@ SoundFlow es una aplicación web de música con múltiples clientes y servidores
 | `frontend/src/features/catalog/` | Biblioteca, filtros y selección |
 | `frontend/src/features/player/` | Controlador, motor de audio, reproductor y cola |
 | `frontend/src/features/cluster/` | Estado y configuración de los servidores |
+| `frontend/src/features/offline/` | Copias recientes, integridad, IndexedDB y controles locales |
 | `frontend/src/services/` | Cliente HTTP, asignación y consulta de tickets |
 | `frontend/src/styles/` | Tema, estilos base y estilos por función |
 | `frontend/public/worklets/` | Procesador PCM del hilo de audio |
@@ -56,6 +64,8 @@ SoundFlow es una aplicación web de música con múltiples clientes y servidores
 - FFmpeg; localmente se utiliza el del sistema o el de `imageio-ffmpeg`. La imagen Docker instala FFmpeg.
 
 El backend ya no necesita Tkinter, pygame ni una salida de audio en el servidor.
+
+El service worker se genera solo con `npm run build`. Para probar la compilación con base `/SoundFlow/`, usa `npm run preview:pwa`; `npm run dev` sirve para desarrollar y no registra un worker nuevo.
 
 ## Instalación local
 
@@ -131,6 +141,11 @@ Abre **http://localhost:5173**. En desarrollo se utilizan los servidores locales
 
 ## Uso
 
+La sección **Disponibles sin conexión** conserva como máximo tres canciones recientes completas, verificadas por tamaño y SHA-256. Al escuchar una pista desde un servidor, comienza una descarga comprimida después de 1.5 segundos de reproducción; si cambias de canción o detienes, se cancela la copia pendiente. Al incorporar una cuarta copia, se reemplaza la menos recientemente utilizada. Puedes desactivar el guardado automático, eliminar una copia o borrarlas todas. Las copias se almacenan solo en este navegador/aplicación, no se suben a Git. El límite por copia es 24 MiB (hasta 72 MiB para tres); depende del espacio permitido por el navegador.
+
+Las copias locales utilizan el mismo AudioWorklet y los mismos controles, sin crear sesiones de servidor. El archivo MP3 se decodifica en memoria únicamente al reproducirlo. La caché del service worker sigue guardando solo la interfaz: la música completa está separada en IndexedDB.
+
+
 Pulsa una canción o su botón de reproducción para escucharla directamente. Para preparar varias, marca sus casillas y usa **Agregar a cola**. El panel se abre al agregar canciones, se oculta cuando queda vacío y puede alternarse con **Cola**.
 
 El reproductor inferior permite pausar, continuar, detener, cambiar de pista y ajustar el volumen. La barra de tiempo solicita audio desde la posición elegida; el avance realizado mientras está pausado conserva la pausa. La recepción de audio se mantiene progresiva, con un búfer de aproximadamente 20 segundos para evitar descargar toda la canción en memoria.
@@ -164,6 +179,7 @@ Los umbrales de admisión son 95 % de CPU y memoria por defecto. La espera del s
 | DELETE | `/api/requests/<id>` | Cancelar solicitud y sesión |
 | POST | `/api/internal/streams` | Reserva interna entre servidores |
 | GET | `/api/streams/<id>/audio` | Audio PCM progresivo |
+| GET | `/api/streams/<id>/download` | Copia MP3 completa desde una reserva iniciada en cero |
 | GET | `/api/streams/<id>` | Estado de la transferencia |
 | DELETE | `/api/streams/<id>` | Cancelar transferencia |
 

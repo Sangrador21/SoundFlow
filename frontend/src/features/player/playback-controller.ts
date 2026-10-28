@@ -3,6 +3,7 @@ import { ClusterApi, ApiError } from "../../services/cluster-api";
 import { delay, errorMessage } from "../../utils/format";
 import type { EngineEvent, PlayerEngine } from "./audio/audio-engine";
 import { PcmDecoder, SAMPLE_RATE } from "./audio/pcm-decoder";
+import type { OfflineSource } from "../offline/offline-store";
 
 export type PlaybackStatus =
   | "idle"
@@ -29,6 +30,7 @@ export interface PlaybackState {
   server: string | null;
   waitPosition: number;
   message: string;
+  source: "server" | "local" | null;
 }
 export class PlaybackController {
   private state: PlaybackState = {
@@ -43,6 +45,7 @@ export class PlaybackController {
     server: null,
     waitPosition: 0,
     message: "Elige una canción para comenzar.",
+    source: null,
   };
   private listeners = new Set<() => void>();
   private history: Song[] = [];
@@ -57,6 +60,7 @@ export class PlaybackController {
   constructor(
     private api: ClusterApi,
     private readonly engine: PlayerEngine,
+    private readonly offline?: OfflineSource,
   ) {
     engine.onEvent = (event) => this.handleEngine(event);
   }
@@ -80,7 +84,21 @@ export class PlaybackController {
     this.api = api;
   }
 
-  play(song: Song, start = 0, remember = true, paused = false): void {
+  play(
+    song: Song,
+    start = 0,
+    remember = true,
+    paused = false,
+    local = false,
+  ): void {
+    const useLocal = local || navigator.onLine === false;
+    if (useLocal && !this.offline?.has(song.id)) {
+      this.update({
+        message:
+          "Esta canción no tiene una copia completa disponible sin conexión.",
+      });
+      return;
+    }
     // El permiso de audio debe solicitarse en el mismo gesto del usuario.
     const ready = this.engine.unlock();
     ready.catch(() => undefined);
@@ -106,17 +124,71 @@ export class PlaybackController {
       entry: null,
       waitPosition: 0,
       message: "Preparando tu canción…",
+      source: useLocal ? "local" : "server",
     });
     const signal = this.abort.signal;
     void ready
       .then(() => {
         if (id !== this.generation || signal.aborted) return;
         this.engine.reset(id, paused);
-        return this.download(song, id, signal);
+        return useLocal
+          ? this.playLocal(song, id, signal)
+          : this.download(song, id, signal);
       })
       .catch((error) => {
         if (id === this.generation && !signal.aborted) this.fail(error);
       });
+  }
+  playOffline(song: Song): void {
+    this.play(song, 0, true, false, true);
+  }
+
+  private async playLocal(
+    song: Song,
+    id: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const copy = await this.offline?.get(song.id);
+    if (signal.aborted || id !== this.generation) return;
+    if (!copy || !this.engine.decodeFile)
+      throw new Error(
+        "La copia local ya no está disponible. Vuelve a guardarla con conexión.",
+      );
+    const audio = await this.engine.decodeFile(copy.blob);
+    if (signal.aborted || id !== this.generation) return;
+    if (!audio.length || audio.sampleRate !== SAMPLE_RATE)
+      throw new Error("La copia local tiene un formato de audio incompatible.");
+    this.start = Math.min(this.start, Math.max(0, audio.duration - 0.05));
+    this.update({
+      current: { ...song, duration: audio.duration },
+      position: this.start,
+      bufferedUntil: this.start,
+      source: "local",
+      server: null,
+      entry: null,
+      status: this.shouldPause ? "paused" : "buffering",
+      message: "Reproduciendo la copia guardada en este dispositivo.",
+    });
+    void this.offline?.touch(song.id).catch(() => {});
+    const left = audio.getChannelData(0);
+    const right = audio.getChannelData(Math.min(1, audio.numberOfChannels - 1));
+    for (
+      let offset = Math.round(this.start * SAMPLE_RATE);
+      offset < audio.length;
+      offset += 65536
+    ) {
+      while (this.state.bufferedUntil - this.state.position > 20)
+        await delay(100, signal);
+      if (signal.aborted || id !== this.generation) return;
+      const end = Math.min(offset + 65536, audio.length);
+      this.engine.feed(id, {
+        left: left.slice(offset, end),
+        right: right.slice(offset, end),
+        frames: end - offset,
+      });
+      this.update({ bufferedUntil: end / SAMPLE_RATE });
+    }
+    if (!signal.aborted && id === this.generation) this.engine.finish(id);
   }
   private async download(
     song: Song,
@@ -214,6 +286,13 @@ export class PlaybackController {
       } catch (error) {
         if (signal.aborted || id !== this.generation) return;
         if (
+          this.offline?.has(song.id) &&
+          !(error instanceof ApiError && [400, 403, 415].includes(error.status))
+        ) {
+          this.play(song, this.state.position, false, this.shouldPause, true);
+          return;
+        }
+        if (
           error instanceof ApiError &&
           [400, 403, 404, 415, 504].includes(error.status)
         )
@@ -261,7 +340,13 @@ export class PlaybackController {
       return;
     }
     if (event.type === "ended") {
-      if (this.state.queue.length) this.next();
+      if (
+        this.state.queue.some(
+          (item) =>
+            navigator.onLine !== false || this.offline?.has(item.song.id),
+        )
+      )
+        this.next();
       else
         this.update({
           status: "ended",
@@ -285,7 +370,9 @@ export class PlaybackController {
       status: event.buffering ? "buffering" : "playing",
       message: event.buffering
         ? "Preparando más audio…"
-        : "Disfruta tu música.",
+        : this.state.source === "local"
+          ? "Reproduciendo una copia sin conexión."
+          : "Disfruta tu música.",
     });
   }
   toggle(): void {
@@ -309,7 +396,7 @@ export class PlaybackController {
           if (id === this.generation) this.fail(error);
         });
     } else if (!["loading", "waiting"].includes(status))
-      this.play(current, 0, false);
+      this.play(current, 0, false, false, this.state.source === "local");
   }
   seek(second: number): void {
     if (this.state.current)
@@ -318,6 +405,7 @@ export class PlaybackController {
         second,
         false,
         this.state.status === "paused",
+        this.state.source === "local",
       );
   }
   stop(): void {
@@ -364,20 +452,32 @@ export class PlaybackController {
   }
   playQueued(key: string): void {
     const item = this.state.queue.find((row) => row.key === key);
+    if (item && navigator.onLine === false && !this.offline?.has(item.song.id))
+      return;
     if (item) {
       this.remove(key);
       this.play(item.song);
     }
   }
   next(): void {
-    const next = this.state.queue[0];
+    const next = this.state.queue.find(
+      (item) => navigator.onLine !== false || this.offline?.has(item.song.id),
+    );
     if (next) this.playQueued(next.key);
   }
   previous(): void {
     if (this.state.current && this.state.position > 3)
-      this.play(this.state.current, 0, false);
+      this.play(
+        this.state.current,
+        0,
+        false,
+        false,
+        this.state.source === "local",
+      );
     else if (this.history.length) {
-      const song = this.history.pop()!;
+      const song = this.history.at(-1)!;
+      if (navigator.onLine === false && !this.offline?.has(song.id)) return;
+      this.history.pop();
       if (this.state.current)
         this.update({
           queue: [
@@ -386,7 +486,14 @@ export class PlaybackController {
           ],
         });
       this.play(song, 0, false);
-    } else if (this.state.current) this.play(this.state.current, 0, false);
+    } else if (this.state.current)
+      this.play(
+        this.state.current,
+        0,
+        false,
+        false,
+        this.state.source === "local",
+      );
   }
   dispose(): void {
     this.cancel();
