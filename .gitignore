@@ -48,3 +48,7 @@ frontend/dist/
 *.tsbuildinfo
 coverage/
 .local_music/
+
+# Browser verification artifacts
+frontend/test-results/
+frontend/playwright-report/

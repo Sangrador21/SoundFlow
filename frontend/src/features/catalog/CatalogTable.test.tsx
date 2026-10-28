@@ -9,6 +9,7 @@ vi.mock("../../app/SoundFlowProvider", () => ({
   useSoundFlow: () => ({
     player: { play, add },
     playback: { current: null, status: "idle" },
+    offline: { has: () => false },
   }),
 }));
 

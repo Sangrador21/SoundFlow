@@ -28,7 +28,11 @@ export function NowPlaying() {
             : "Un solo lugar para todas tus canciones. Elige una y deja que suene."}
         </p>
         <div className="hero-tag">
-          {playback.server ? (
+          {playback.source === "local" ? (
+            <>
+              <Disc3 size={14} /> Copia local · Sin conexión
+            </>
+          ) : playback.server ? (
             <>
               <i className={playing ? "dot dot--green" : "dot dot--lilac"} />
               Audio desde {playback.server}

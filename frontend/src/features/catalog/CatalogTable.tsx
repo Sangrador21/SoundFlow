@@ -5,6 +5,7 @@ import type { Song } from "../../types/api";
 import { Artwork } from "../../components/ui/Artwork";
 import { Button, IconButton } from "../../components/ui/Button";
 import { displayArtist, formatTime } from "../../utils/format";
+import { useOnline } from "../../pwa/network";
 
 export function CatalogTable({
   songs,
@@ -13,7 +14,8 @@ export function CatalogTable({
   songs: Song[];
   loading: boolean;
 }) {
-  const { player, playback } = useSoundFlow();
+  const { player, playback, offline } = useSoundFlow();
+  const online = useOnline();
   const [query, setQuery] = useState("");
   const [server, setServer] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -29,7 +31,9 @@ export function CatalogTable({
       ),
     [songs, query, server],
   );
-  const selectedSongs = songs.filter((song) => selected.has(song.id));
+  const selectedSongs = songs.filter(
+    (song) => selected.has(song.id) && (online || offline.has(song.id)),
+  );
   const selectedVisible = filtered.filter((song) =>
     selected.has(song.id),
   ).length;
@@ -189,6 +193,7 @@ export function CatalogTable({
                     <td>
                       <button
                         className="song-name"
+                        disabled={!online && !offline.has(song.id)}
                         onClick={() => player.play(song)}
                         aria-label={`Reproducir ${song.title}`}
                       >
@@ -220,6 +225,9 @@ export function CatalogTable({
                             {id}
                           </span>
                         ))}
+                        {offline.has(song.id) && (
+                          <span className="offline-source">Guardada</span>
+                        )}
                       </div>
                     </td>
                     <td className="duration-cell">
@@ -228,6 +236,7 @@ export function CatalogTable({
                     <td className="action-cell">
                       <IconButton
                         label={`Agregar ${song.title} a la cola`}
+                        disabled={!online && !offline.has(song.id)}
                         onClick={() => player.add([song])}
                       >
                         <ListPlus size={18} />

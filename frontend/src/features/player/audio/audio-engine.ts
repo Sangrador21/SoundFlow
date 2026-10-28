@@ -11,6 +11,7 @@ export interface EngineEvent {
 export interface PlayerEngine {
   onEvent: (event: EngineEvent) => void;
   unlock(): Promise<void>;
+  decodeFile?(blob: Blob): Promise<AudioBuffer>;
   reset(id: number, paused: boolean): void;
   feed(id: number, block: StereoBlock): void;
   finish(id: number): void;
@@ -26,6 +27,12 @@ export class AudioEngine implements PlayerEngine {
   private initialization: Promise<void> | null = null;
   private id = 0;
   private level = 0.7;
+
+  async decodeFile(blob: Blob): Promise<AudioBuffer> {
+    if (!this.context)
+      throw new Error("Activa el audio antes de abrir la copia local.");
+    return this.context.decodeAudioData(await blob.arrayBuffer());
+  }
 
   async unlock(): Promise<void> {
     // resume se invoca desde el clic, antes de esperar la red o cargar el módulo.

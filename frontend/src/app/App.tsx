@@ -12,10 +12,14 @@ import { Sidebar } from "../components/layout/Sidebar";
 import type { View } from "../components/layout/Sidebar";
 import { Header } from "../components/layout/Header";
 import { Button } from "../components/ui/Button";
+import { PwaPanel } from "../pwa/PwaPanel";
+import { useOnline } from "../pwa/network";
+import { OfflinePanel } from "../features/offline/OfflinePanel";
 
 export function App() {
   const { playback, servers } = useSoundFlow();
-  const { catalog, loading, error, refresh } = useCatalog();
+  const { catalog, loading, error, refresh, saved } = useCatalog();
+  const online = useOnline();
   const [view, setView] = useState<View>("library");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const { player } = useSoundFlow();
@@ -40,7 +44,14 @@ export function App() {
         />
         <main id="main-content" className="main-content">
           <div className="content-width">
-            {(!servers.length || error) && (
+            <PwaPanel />
+            {saved && (
+              <p className="catalog-saved" role="status">
+                Última biblioteca guardada: información de referencia, sin
+                verificar disponibilidad actual.
+              </p>
+            )}
+            {online && (!servers.length || error) && (
               <div className="connection-notice" role="alert">
                 <CircleAlert size={20} />
                 <div>
@@ -77,10 +88,13 @@ export function App() {
                   </div>
                   <span>
                     <Cloud size={15} />
-                    Tu biblioteca conectada
+                    {online && !saved
+                      ? "Tu biblioteca conectada"
+                      : "Tu biblioteca guardada"}
                   </span>
                 </div>
                 <NowPlaying />
+                <OfflinePanel />
                 <div
                   className={`library-layout ${playback.queueOpen ? "with-queue" : ""}`}
                 >

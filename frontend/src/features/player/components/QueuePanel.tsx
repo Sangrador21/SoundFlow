@@ -3,9 +3,11 @@ import { useSoundFlow } from "../../../app/SoundFlowProvider";
 import { IconButton, Button } from "../../../components/ui/Button";
 import { Artwork } from "../../../components/ui/Artwork";
 import { displayArtist, formatTime } from "../../../utils/format";
+import { useOnline } from "../../../pwa/network";
 
 export function QueuePanel() {
-  const { playback, player } = useSoundFlow();
+  const { playback, player, offline } = useSoundFlow();
+  const online = useOnline();
   if (!playback.queueOpen) return null;
   return (
     <aside className="queue-panel card" aria-label="Cola de reproducción">
@@ -29,6 +31,7 @@ export function QueuePanel() {
                 <Artwork id={item.song.id} />
                 <button
                   className="queue-track"
+                  disabled={!online && !offline.has(item.song.id)}
                   onClick={() => player.playQueued(item.key)}
                   aria-label={`Reproducir ${item.song.title} desde la cola`}
                 >

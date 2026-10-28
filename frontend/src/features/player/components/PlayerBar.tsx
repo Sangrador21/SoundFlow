@@ -16,9 +16,11 @@ import { useSoundFlow } from "../../../app/SoundFlowProvider";
 import { IconButton } from "../../../components/ui/Button";
 import { Artwork } from "../../../components/ui/Artwork";
 import { displayArtist, formatTime } from "../../../utils/format";
+import { useOnline } from "../../../pwa/network";
 
 export function PlayerBar() {
-  const { playback: p, player } = useSoundFlow();
+  const { playback: p, player, offline } = useSoundFlow();
+  const online = useOnline();
   const [draft, setDraft] = useState<{ id: string; value: number } | null>(
     null,
   );
@@ -51,7 +53,7 @@ export function PlayerBar() {
         <div className="transport-controls">
           <IconButton
             label="Canción anterior"
-            disabled={!p.current}
+            disabled={!p.current || (!online && !offline.has(p.current.id))}
             onClick={() => player.previous()}
           >
             <SkipBack size={19} fill="currentColor" />
@@ -74,7 +76,9 @@ export function PlayerBar() {
           </IconButton>
           <IconButton
             label="Siguiente canción"
-            disabled={!p.queue.length}
+            disabled={
+              !p.queue.some((item) => online || offline.has(item.song.id))
+            }
             onClick={() => player.next()}
           >
             <SkipForward size={19} fill="currentColor" />
@@ -96,7 +100,9 @@ export function PlayerBar() {
             max={duration || 1}
             step={0.1}
             value={Math.min(position, duration || 1)}
-            disabled={!duration}
+            disabled={
+              !duration || (!online && !offline.has(p.current?.id || ""))
+            }
             aria-label="Posición de reproducción"
             aria-valuetext={`${formatTime(position)} de ${formatTime(duration)}`}
             style={
