@@ -1,0 +1,15 @@
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+RUN useradd --create-home soundflow
+COPY deploy/docker/control-requirements.txt backend/constraints.txt /tmp/
+RUN pip install --no-cache-dir -r /tmp/control-requirements.txt -c /tmp/constraints.txt
+COPY backend/soundflow/__init__.py backend/soundflow/http_utils.py /app/backend/soundflow/
+COPY backend/microservices/__init__.py backend/microservices/common.py backend/microservices/settings.py backend/microservices/wsgi.py /app/backend/microservices/
+COPY backend/gunicorn.conf.py /app/backend/gunicorn.conf.py
+COPY backend/microservices/catalog.py /app/backend/microservices/
+ENV SOUNDFLOW_SERVICE=catalog
+RUN mkdir /app/state && chown -R soundflow:soundflow /app
+USER soundflow
+EXPOSE 10000
+CMD ["gunicorn", "--chdir", "backend", "--config", "/app/backend/gunicorn.conf.py", "microservices.wsgi:app"]

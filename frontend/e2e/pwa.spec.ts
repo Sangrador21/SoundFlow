@@ -4,7 +4,7 @@ test.beforeEach(async ({ page, request }) => {
   await request.post("/__test__/download-mode?mode=full");
   await page.addInitScript(() => {
     localStorage.setItem(
-      "soundflow.servers.v1",
+      "soundflow.gateways.v1",
       JSON.stringify(["http://127.0.0.1:4174"]),
     );
   });

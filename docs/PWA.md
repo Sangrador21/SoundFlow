@@ -1,6 +1,6 @@
-# SoundFlow P07: aplicación web progresiva
+# SoundFlow P08: PWA y copias locales conservadas de P07
 
-La PWA utiliza la API REST/JSON de P06 sin modificar sus contratos, catálogos distribuidos, coordinación FIFO, reservas ni audio PCM. JSON corresponde a metadatos y operaciones; el audio sigue siendo binario. No había XML que convertir.
+La PWA conserva el comportamiento de P07 y consume la API REST/JSON a través del gateway de P08. El catálogo y la coordinación se ejecutan en servicios separados; PCM y MP3 se reciben del nodo de medios asignado. JSON describe operaciones y metadatos; el audio sigue siendo binario.
 
 ## Organización
 
@@ -51,23 +51,13 @@ Las copias son de este navegador o aplicación instalada. Safari y una app añad
 
 ## Prueba local
 
-Desde la raíz y con el entorno de Python activo:
+Desde la raíz y con el entorno de Python activo, detén antes los servidores P07:
 
 ```bash
-python tools/build_catalog.py
+python tools/run_microservices.py
 ```
 
-Terminal S1:
-
-```bash
-python backend/server.py --port 5000 --server-id S1 --music .local_music/S1 --peer http://127.0.0.1:5001
-```
-
-Terminal S2:
-
-```bash
-python backend/server.py --port 5001 --server-id S2 --music .local_music/S2 --peer http://127.0.0.1:5000
-```
+Este lanzador prepara bibliotecas e inicia gateway, catálogo, reproducción y dos medios. Consulta [MICROSERVICES.md](MICROSERVICES.md) para puertos, Docker y contratos.
 
 Terminal frontend, desde la raíz:
 
@@ -75,11 +65,11 @@ Terminal frontend, desde la raíz:
 cd frontend
 npm ci
 npm test
-VITE_API_URLS="http://127.0.0.1:5000,http://127.0.0.1:5001" VITE_BASE_PATH="/SoundFlow/" npm run build
+VITE_API_URLS="http://127.0.0.1:8000" VITE_BASE_PATH="/SoundFlow/" npm run build
 npm run preview:pwa
 ```
 
-Abre `http://localhost:5173/SoundFlow/`. El puerto 5173 coincide con los orígenes CORS del backend local. Cierra antes cualquier `npm run dev` en ese puerto. Si guardaste otras URL, configura de nuevo los dos nodos locales desde la aplicación.
+Abre `http://localhost:5173/SoundFlow/`. El puerto 5173 coincide con los orígenes CORS del backend local. Cierra antes cualquier `npm run dev` en ese puerto. Si guardaste otras URL, configura solo el gateway local http://127.0.0.1:8000 desde la aplicación.
 
 Para volver a desarrollo en el mismo origen, desregistra el worker desde las herramientas del navegador; de lo contrario puede seguir sirviendo la compilación anterior.
 
@@ -88,7 +78,7 @@ Para volver a desarrollo en el mismo origen, desregistra el worker desde las her
 ```bash
 # Desde la raíz
 python -m pytest -q
-python tools/check_web_integration.py
+python tools/check_microservices.py
 
 # Desde frontend/
 npm test
@@ -96,7 +86,7 @@ npx playwright install chromium
 npm run test:pwa
 ```
 
-La integración existente utiliza dos procesos Gunicorn y las canciones reales. Las pruebas PWA utilizan Chromium y una API local de prueba con PCM y un MP3 sintéticos para comprobar ámbito, manifiesto, iconos, recarga offline, biblioteca guardada, exclusión de API/audio, actualización con consentimiento, reproducción local sin HTTP, pausa/avance, límite de tres y rechazo de descargas incompletas. No usan cuentas ni modifican el despliegue público. La instalación desde el menú del navegador y la salida física de audio deben comprobarse manualmente.
+La integración P08 utiliza cinco procesos Gunicorn independientes y las canciones reales. Las pruebas PWA utilizan Chromium y una API local de prueba con PCM y un MP3 sintéticos para comprobar ámbito, manifiesto, iconos, recarga offline, biblioteca guardada, exclusión de API/audio, actualización con consentimiento, reproducción local sin HTTP, pausa/avance, límite de tres y rechazo de descargas incompletas. No usan cuentas ni modifican el despliegue público. La instalación desde el menú del navegador y la salida física de audio deben comprobarse manualmente.
 
 ## Evidencias y verificación pública
 

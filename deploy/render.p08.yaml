@@ -1,0 +1,99 @@
+# Blueprint P08 separado: rama feature/microservices-p08. Ver docs/DEPLOYMENT_P08.md.
+envVarGroups:
+- name: soundflow-p08-internal
+  envVars:
+  - key: SOUNDFLOW_CLUSTER_TOKEN
+    generateValue: true
+services:
+- type: web
+  name: soundflow-p08-media-s1
+  runtime: docker
+  plan: free
+  branch: feature/microservices-p08
+  dockerfilePath: ./deploy/docker/Dockerfile.media
+  dockerContext: .
+  healthCheckPath: /api/health
+  envVars:
+  - fromGroup: soundflow-p08-internal
+  - key: SOUNDFLOW_RPC_TIMEOUT
+    value: '10'
+  - key: SOUNDFLOW_SERVICE
+    value: media
+  - key: SOUNDFLOW_NODE_ID
+    value: S1
+  - key: SOUNDFLOW_CORS_ORIGINS
+    value: https://sangrador21.github.io
+- type: web
+  name: soundflow-p08-media-s2
+  runtime: docker
+  plan: free
+  branch: feature/microservices-p08
+  dockerfilePath: ./deploy/docker/Dockerfile.media
+  dockerContext: .
+  healthCheckPath: /api/health
+  envVars:
+  - fromGroup: soundflow-p08-internal
+  - key: SOUNDFLOW_RPC_TIMEOUT
+    value: '10'
+  - key: SOUNDFLOW_SERVICE
+    value: media
+  - key: SOUNDFLOW_NODE_ID
+    value: S2
+  - key: SOUNDFLOW_CORS_ORIGINS
+    value: https://sangrador21.github.io
+- type: web
+  name: soundflow-p08-catalog
+  runtime: docker
+  plan: free
+  branch: feature/microservices-p08
+  dockerfilePath: ./deploy/docker/Dockerfile.catalog
+  dockerContext: .
+  healthCheckPath: /api/health
+  envVars:
+  - fromGroup: soundflow-p08-internal
+  - key: SOUNDFLOW_RPC_TIMEOUT
+    value: '10'
+  - key: SOUNDFLOW_SERVICE
+    value: catalog
+  - key: SOUNDFLOW_MEDIA_NODES
+    value: '{"S1":"https://soundflow-p08-media-s1.onrender.com","S2":"https://soundflow-p08-media-s2.onrender.com"}'
+- type: web
+  name: soundflow-p08-playback
+  runtime: docker
+  plan: free
+  branch: feature/microservices-p08
+  dockerfilePath: ./deploy/docker/Dockerfile.playback
+  dockerContext: .
+  healthCheckPath: /api/health
+  envVars:
+  - fromGroup: soundflow-p08-internal
+  - key: SOUNDFLOW_RPC_TIMEOUT
+    value: '10'
+  - key: SOUNDFLOW_SERVICE
+    value: playback
+  - key: SOUNDFLOW_MEDIA_NODES
+    value: '{"S1":"https://soundflow-p08-media-s1.onrender.com","S2":"https://soundflow-p08-media-s2.onrender.com"}'
+  - key: SOUNDFLOW_CATALOG_URL
+    value: https://soundflow-p08-catalog.onrender.com
+  - key: SOUNDFLOW_WAIT_TIMEOUT
+    value: '120'
+- type: web
+  name: soundflow-p08-gateway
+  runtime: docker
+  plan: free
+  branch: feature/microservices-p08
+  dockerfilePath: ./deploy/docker/Dockerfile.gateway
+  dockerContext: .
+  healthCheckPath: /api/health
+  envVars:
+  - fromGroup: soundflow-p08-internal
+  - key: SOUNDFLOW_RPC_TIMEOUT
+    value: '10'
+  - key: SOUNDFLOW_SERVICE
+    value: gateway
+  - key: SOUNDFLOW_CATALOG_URL
+    value: https://soundflow-p08-catalog.onrender.com
+  - key: SOUNDFLOW_PLAYBACK_URL
+    value: https://soundflow-p08-playback.onrender.com
+  - key: SOUNDFLOW_CORS_ORIGINS
+    value: https://sangrador21.github.io

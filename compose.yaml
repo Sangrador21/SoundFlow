@@ -1,0 +1,70 @@
+name: soundflow-p08
+x-internal: &internal
+  SOUNDFLOW_CLUSTER_TOKEN: ${SOUNDFLOW_CLUSTER_TOKEN:?Define SOUNDFLOW_CLUSTER_TOKEN en .env o en tu terminal}
+  SOUNDFLOW_RPC_TIMEOUT: '3'
+x-nodes: &nodes
+  <<: *internal
+  SOUNDFLOW_MEDIA_NODES: '{"S1":"http://media-s1:10000","S2":"http://media-s2:10000"}'
+x-health: &health
+  test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/api/health',timeout=2)"]
+  interval: 10s
+  timeout: 3s
+  retries: 5
+  start_period: 20s
+services:
+  media-s1:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.media
+      args: {SOUNDFLOW_NODE_ID: S1}
+    environment:
+      <<: *internal
+      SOUNDFLOW_NODE_ID: S1
+      SOUNDFLOW_BASE_URL: http://127.0.0.1:5000
+      SOUNDFLOW_CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    ports: ['127.0.0.1:5000:10000']
+    healthcheck: *health
+  media-s2:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.media
+      args: {SOUNDFLOW_NODE_ID: S2}
+    environment:
+      <<: *internal
+      SOUNDFLOW_NODE_ID: S2
+      SOUNDFLOW_BASE_URL: http://127.0.0.1:5001
+      SOUNDFLOW_CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    ports: ['127.0.0.1:5001:10000']
+    healthcheck: *health
+  catalog:
+    build: {context: ., dockerfile: deploy/docker/Dockerfile.catalog}
+    environment: *nodes
+    depends_on:
+      media-s1: {condition: service_healthy}
+      media-s2: {condition: service_healthy}
+    healthcheck: *health
+  playback:
+    build: {context: ., dockerfile: deploy/docker/Dockerfile.playback}
+    environment:
+      <<: *nodes
+      SOUNDFLOW_CATALOG_URL: http://catalog:10000
+      SOUNDFLOW_WAIT_TIMEOUT: '120'
+    depends_on:
+      catalog: {condition: service_healthy}
+    volumes: [playback-state:/app/state]
+    healthcheck: *health
+  gateway:
+    build: {context: ., dockerfile: deploy/docker/Dockerfile.gateway}
+    environment:
+      <<: *internal
+      SOUNDFLOW_BASE_URL: http://127.0.0.1:8000
+      SOUNDFLOW_CATALOG_URL: http://catalog:10000
+      SOUNDFLOW_PLAYBACK_URL: http://playback:10000
+      SOUNDFLOW_CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    depends_on:
+      catalog: {condition: service_healthy}
+      playback: {condition: service_healthy}
+    ports: ['127.0.0.1:8000:10000']
+    healthcheck: *health
+volumes:
+  playback-state:

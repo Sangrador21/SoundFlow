@@ -1,4 +1,6 @@
-# Despliegue de SoundFlow: Render y GitHub Pages
+# Despliegue histórico P06/P07: Render y GitHub Pages
+
+Para la P08 utiliza [DEPLOYMENT_P08.md](DEPLOYMENT_P08.md). Esta página documenta únicamente la publicación anterior, que se conserva durante la transición.
 
 P07 amplía el frontend de P06 con una PWA. Conserva los servicios existentes:
 

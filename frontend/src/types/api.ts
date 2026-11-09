@@ -24,6 +24,7 @@ export interface Catalog {
   songs: Song[];
   nodes: ClusterNode[];
   offline: string[];
+  entrypoints?: string[];
 }
 export interface StreamAssignment {
   stream_id: string;
