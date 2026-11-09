@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { PlaybackController } from "./playback-controller";
 import { ClusterApi } from "../../services/cluster-api";
+import { interruptAfterBytes } from "../../test/interrupted-response";
 import {
   assigned,
   FakeEngine,
@@ -106,7 +107,7 @@ describe("Reproductor web", () => {
     expect(player.getSnapshot().status).toBe("ended");
     player.dispose();
   });
-  it("reanuda una transferencia interrumpida sin duplicar muestras ni canales", async () => {
+  it.each([false, true])("reanuda sin duplicar muestras ni canales (fallo antes del audio: %s)", async (failBeforeAudio) => {
     const bytes = new Uint8Array(32);
     const view = new DataView(bytes.buffer);
     for (let i = 0; i < 16; i++) view.setInt16(i * 2, i * 256, true);
@@ -117,19 +118,15 @@ describe("Reproductor web", () => {
       if (init?.method === "POST") {
         const start = JSON.parse(init.body as string).start as number;
         starts.push(start);
+        if (failBeforeAudio && starts.length === 1)
+          throw new TypeError("Conexión cerrada antes de recibir audio");
         return json(assigned(starts.length, start));
       }
       if (String(url).endsWith("/audio")) {
         if (attempts++ === 0) {
-          let pulled = 0;
-          return new Response(
-            new ReadableStream<Uint8Array>({
-              pull(controller) {
-                if (!pulled++) controller.enqueue(bytes.slice(0, 10));
-                else controller.error(new TypeError("Red interrumpida"));
-              },
-            }),
-            { headers: pcmHeaders },
+          return interruptAfterBytes(
+            new Response(bytes, { headers: pcmHeaders }),
+            10,
           );
         }
         return new Response(bytes.slice(8), { headers: pcmHeaders });
@@ -145,7 +142,7 @@ describe("Reproductor web", () => {
     await vi.waitFor(() => expect(engine.ends).toHaveLength(1), {
       timeout: 4000,
     });
-    expect(starts).toEqual([0, 2 / 44100]);
+    expect(starts).toEqual(failBeforeAudio ? [0, 0, 2 / 44100] : [0, 2 / 44100]);
     expect(engine.blocks.flatMap((block) => [...block.left])).toEqual(
       Array.from({ length: 8 }, (_, i) => (i * 512) / 32768),
     );

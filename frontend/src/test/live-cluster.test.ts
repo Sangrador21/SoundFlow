@@ -5,6 +5,7 @@ import { PlaybackController } from "../features/player/playback-controller";
 import type { StereoBlock } from "../features/player/audio/pcm-decoder";
 import { FakeEngine } from "./fakes";
 import { expectedCatalog } from "./catalog-expectations";
+import { interruptAfterBytes } from "./interrupted-response";
 
 const servers = (process.env.SOUNDFLOW_LIVE_URLS || "")
   .split(",")
@@ -93,6 +94,8 @@ it.skipIf(!servers.length)(
     );
     catalogApi.release(baseline);
     let interrupted = false;
+    // 2048 muestras estéreo completas y tres bytes que deben volver a pedirse.
+    const cutBytes = 8195;
     const starts: number[] = [];
     const flakyFetch: typeof fetch = async (url, init) => {
       if (init?.method === "POST")
@@ -100,32 +103,7 @@ it.skipIf(!servers.length)(
       const response = await fetch(url, init);
       if (!String(url).endsWith("/audio") || interrupted) return response;
       interrupted = true;
-      const reader = response.body!.getReader();
-      let delivered = false;
-      return new Response(
-        new ReadableStream<Uint8Array>({
-          async pull(controller) {
-            if (delivered) {
-              // Deja que el consumidor reciba el primer bloque antes de cortar.
-              // ReadableStream puede adelantar pull() y descartar la cola al fallar.
-              await new Promise((resolve) => setTimeout(resolve, 10));
-              void reader.cancel();
-              controller.error(new TypeError("Interrupción de prueba"));
-              return;
-            }
-            const chunk = await reader.read();
-            if (chunk.done) controller.close();
-            else {
-              delivered = true;
-              controller.enqueue(chunk.value);
-            }
-          },
-          cancel() {
-            return reader.cancel();
-          },
-        }),
-        { status: response.status, headers: response.headers },
-      );
+      return interruptAfterBytes(response, cutBytes);
     };
     class ConsumingEngine extends FakeEngine {
       frames = 0;
@@ -151,8 +129,17 @@ it.skipIf(!servers.length)(
       await vi.waitFor(() => expect(engine.ends).toHaveLength(1), {
         timeout: 20_000,
       });
-      expect(starts).toHaveLength(2);
-      expect(starts[1]).toBeGreaterThan(starts[0]!);
+      expect(interrupted).toBe(true);
+      // Un fallo de transporte antes de recibir PCM puede repetir la misma
+      // reserva. Solo debe avanzar una vez: después de las 2048 muestras.
+      const positions = starts.filter(
+        (value, index) => index === 0 || value !== starts[index - 1],
+      );
+      const initialStart = Math.round(start * 44_100) / 44_100;
+      expect(positions).toEqual([
+        initialStart,
+        initialStart + Math.floor(cutBytes / 4) / 44_100,
+      ]);
       const left = new Float32Array(
         engine.blocks.flatMap((block) => Array.from(block.left)),
       );
