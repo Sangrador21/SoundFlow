@@ -106,6 +106,9 @@ it.skipIf(!servers.length)(
         new ReadableStream<Uint8Array>({
           async pull(controller) {
             if (delivered) {
+              // Deja que el consumidor reciba el primer bloque antes de cortar.
+              // ReadableStream puede adelantar pull() y descartar la cola al fallar.
+              await new Promise((resolve) => setTimeout(resolve, 10));
               void reader.cancel();
               controller.error(new TypeError("Interrupción de prueba"));
               return;

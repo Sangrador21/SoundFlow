@@ -78,7 +78,8 @@ export class ClusterApi {
           return data;
         }),
       );
-      this.learned = result.nodes.map((node) => node.base_url);
+      // En P08 los medios no coordinan solicitudes: solo se aprenden gateways.
+      this.learned = result.entrypoints ?? result.nodes.map((node) => node.base_url);
       return result;
     } catch {
       if (signal.aborted) throw abortError();

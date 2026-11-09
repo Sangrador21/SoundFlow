@@ -52,3 +52,6 @@ coverage/
 # Browser verification artifacts
 frontend/test-results/
 frontend/playwright-report/
+
+# Estado privado de los microservicios P08
+.state/

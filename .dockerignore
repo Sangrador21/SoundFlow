@@ -5,6 +5,7 @@
 **/node_modules
 frontend
 .local_music
+.state
 .demo_music
 music/S1
 music/S2

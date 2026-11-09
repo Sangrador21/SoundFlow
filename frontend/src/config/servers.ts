@@ -1,4 +1,4 @@
-const STORAGE_KEY = "soundflow.servers.v1";
+const STORAGE_KEY = "soundflow.gateways.v1";
 
 export function normalizeServers(
   value: string | string[],
@@ -35,7 +35,7 @@ export function normalizeServers(
 export function defaultServers(): string[] {
   const value =
     import.meta.env.VITE_API_URLS ||
-    (import.meta.env.DEV ? "http://127.0.0.1:5000,http://127.0.0.1:5001" : "");
+    (import.meta.env.DEV ? "http://127.0.0.1:8000" : "");
   return normalizeServers(value, location.protocol === "https:");
 }
 export function loadServers(): string[] {
