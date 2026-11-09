@@ -9,7 +9,7 @@ services:
   name: soundflow-p08-media-s1
   runtime: docker
   plan: free
-  branch: feature/microservices-p08
+  branch: main
   dockerfilePath: ./deploy/docker/Dockerfile.media
   dockerContext: .
   healthCheckPath: /api/health
@@ -27,7 +27,7 @@ services:
   name: soundflow-p08-media-s2
   runtime: docker
   plan: free
-  branch: feature/microservices-p08
+  branch: main
   dockerfilePath: ./deploy/docker/Dockerfile.media
   dockerContext: .
   healthCheckPath: /api/health
@@ -45,7 +45,7 @@ services:
   name: soundflow-p08-catalog
   runtime: docker
   plan: free
-  branch: feature/microservices-p08
+  branch: main
   dockerfilePath: ./deploy/docker/Dockerfile.catalog
   dockerContext: .
   healthCheckPath: /api/health
@@ -61,7 +61,7 @@ services:
   name: soundflow-p08-playback
   runtime: docker
   plan: free
-  branch: feature/microservices-p08
+  branch: main
   dockerfilePath: ./deploy/docker/Dockerfile.playback
   dockerContext: .
   healthCheckPath: /api/health
@@ -81,7 +81,7 @@ services:
   name: soundflow-p08-gateway
   runtime: docker
   plan: free
-  branch: feature/microservices-p08
+  branch: main
   dockerfilePath: ./deploy/docker/Dockerfile.gateway
   dockerContext: .
   healthCheckPath: /api/health
